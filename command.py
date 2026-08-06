@@ -61,6 +61,8 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm doctor: run read-only LCM health checks",
         "- /lcm doctor clean: best-effort scan of obvious junk/noise session candidates without deleting anything",
         "- /lcm doctor clean apply: backup-first cleanup for safe pattern-matched candidates only",
+        "- /lcm doctor clean lifecycle: read-only scan for lifecycle rows with zero messages/nodes",
+        "- /lcm doctor clean lifecycle apply: backup-first cleanup of empty lifecycle rows only",
         "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
         "- /lcm doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
         "- /lcm doctor source: read-only scan for legacy blank-source rows",
@@ -95,6 +97,16 @@ def _status_text(engine) -> str:
     }
     protection = status.get("ingest_protection") or sensitive_pattern_status(engine._config)
 
+    uninitialized = "(uninitialized)"
+    unknown = "(unknown)"
+    model = (engine.model or unknown) if session_bound else uninitialized
+    provider = (engine.provider or unknown) if session_bound else uninitialized
+    context_length_source = (
+        (getattr(engine, "_context_length_source", "") or unknown)
+        if session_bound
+        else uninitialized
+    )
+
     lines = [
         "LCM status",
         f"engine: {status.get('engine', engine.name)}",
@@ -108,6 +120,8 @@ def _status_text(engine) -> str:
         f"hermes_home: {runtime_identity.get('hermes_home', '') or '(unset)'}",
         f"session_id: {engine.current_session_id or '(unbound)'}",
         f"session_platform: {engine.current_session_platform or ('(unbound)' if not session_bound else '(unknown)')}",
+        f"model: {model}",
+        f"provider: {provider}",
         f"database_path: {db_path}",
         f"database_path_source: {runtime_identity.get('database_path_source', '(unknown)')}",
         f"database_exists: {_fmt_bool(db_exists)}",
@@ -115,6 +129,9 @@ def _status_text(engine) -> str:
         f"compression_count: {engine.compression_count}",
         f"last_compression_status: {status.get('last_compression_status', 'idle')}",
         f"last_compression_noop_reason: {status.get('last_compression_noop_reason', '') or '(none)'}",
+        f"context_length: {engine.context_length if session_bound else '(uninitialized)'}",
+        f"context_length_source: {context_length_source}",
+        f"context_threshold: {engine._config.context_threshold}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"cache_metrics_available: {_fmt_bool(status.get('cache_metrics_available'))}",
         f"last_input_tokens: {status.get('last_input_tokens', 0)}",
@@ -1415,6 +1432,113 @@ def _doctor_clean_apply_text(engine) -> str:
     ])
 
 
+def _doctor_clean_lifecycle_text(engine) -> str:
+    count = engine._lifecycle.row_count()
+    protected = {str(getattr(engine, "_session_id", "") or "")}
+    protected = {s for s in protected if s}
+
+    conn = engine._lifecycle._conn
+    sessions_with_data: set[str] = set()
+    for row in conn.execute("SELECT DISTINCT session_id FROM messages").fetchall():
+        sessions_with_data.add(str(row[0]))
+    for row in conn.execute("SELECT DISTINCT session_id FROM summary_nodes").fetchall():
+        sessions_with_data.add(str(row[0]))
+
+    empty_current = 0
+    empty_finalized = 0
+    empty_protected = 0
+    rows = conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall()
+    for row in rows:
+        cur = str(row["current_session_id"] or "")
+        fin = str(row["last_finalized_session_id"] or "")
+        if ((cur and cur in sessions_with_data)
+                or (fin and fin in sessions_with_data)):
+            continue
+        refs = {r for r in (cur, fin) if r}
+        if refs & protected:
+            empty_protected += 1
+            continue
+        if cur and not fin:
+            empty_current += 1
+        else:
+            empty_finalized += 1
+
+    total_empty = empty_current + empty_finalized
+    if total_empty == 0:
+        return "\n".join([
+            "LCM doctor clean lifecycle",
+            "status: ok",
+            f"lifecycle_rows: {count}",
+            "empty_rows: 0",
+            "note: no empty lifecycle rows to prune",
+        ])
+
+    return "\n".join([
+        "LCM doctor clean lifecycle",
+        "status: candidates-found",
+        f"lifecycle_rows: {count}",
+        f"empty_rows: {total_empty}",
+        f"  empty_current: {empty_current}",
+        f"  empty_finalized: {empty_finalized}",
+        f"  empty_protected: {empty_protected}",
+        "note: read-only scan — no rows were deleted",
+        "note: empty rows reference sessions with zero messages and zero nodes",
+        "note: use `/lcm doctor clean lifecycle apply` to delete empty rows",
+    ])
+
+
+def _doctor_clean_lifecycle_apply_text(engine) -> str:
+    if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
+        return "\n".join([
+            "LCM doctor clean lifecycle apply",
+            "status: denied",
+            "error: destructive cleanup is disabled by default",
+            "note: set LCM_DOCTOR_CLEAN_APPLY_ENABLED=true only in trusted operator environments",
+            "note: no rows were deleted",
+        ])
+
+    backup = _backup_database(engine)
+    if not backup["ok"]:
+        return "\n".join([
+            "LCM doctor clean lifecycle apply",
+            "status: error",
+            "error: failed to create backup before destructive cleanup",
+            f"database_path: {backup['db_path']}",
+            f"backup_error: {backup['error']}",
+            "note: no rows were deleted",
+        ])
+
+    before = engine._lifecycle.row_count()
+    protected = {str(getattr(engine, "_session_id", "") or "")}
+    protected = {s for s in protected if s}
+
+    try:
+        deleted = engine._lifecycle.prune_empty_sessions(
+            protected_session_ids=protected,
+        )
+    except Exception as exc:
+        return "\n".join([
+            "LCM doctor clean lifecycle apply",
+            "status: error",
+            "error: failed to prune empty sessions",
+            f"backup_path: {backup['backup_path']}",
+            f"prune_error: {exc}",
+            "note: no rows were deleted",
+        ])
+
+    after = engine._lifecycle.row_count()
+    return "\n".join([
+        "LCM doctor clean lifecycle apply",
+        "status: ok",
+        f"lifecycle_rows_before: {before}",
+        f"lifecycle_rows_deleted: {deleted}",
+        f"lifecycle_rows_remaining: {after}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size_bytes: {backup['backup_size']}",
+        "note: only empty lifecycle rows were deleted — messages and nodes untouched",
+    ])
+
+
 def _backup_text(engine) -> str:
     backup = _backup_database(engine)
     if not backup["ok"]:
@@ -1594,11 +1718,15 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
             return _doctor_retention_text(engine)
         if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "apply":
             return _doctor_clean_apply_text(engine)
+        if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "lifecycle":
+            return _doctor_clean_lifecycle_text(engine)
+        if len(rest) == 3 and rest[0].lower() == "clean" and rest[1].lower() == "lifecycle" and rest[2].lower() == "apply":
+            return _doctor_clean_lifecycle_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
             return _doctor_repair_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "source" and rest[1].lower() == "apply":
             return _doctor_source_apply_text(engine)
-        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention` as extra subcommands.")
+        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention` as extra subcommands.")
 
     if head == "backup":
         if rest:

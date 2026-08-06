@@ -43,6 +43,9 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
+from .config import LCMConfig
+from .ingest_protection import redact_sensitive_value
+from .storage_security import ensure_lcm_file_permissions
 
 
 logger = logging.getLogger(__name__)
@@ -152,8 +155,11 @@ class SummaryNode:
 class SummaryDAG:
     """SQLite-backed DAG of summary nodes."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, ingest_protection_config=None):
         self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_lcm_file_permissions(self.db_path)
+        self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
@@ -190,6 +196,7 @@ class SummaryDAG:
         run_versioned_migrations(self._conn)
         self._ensure_source_window_columns()
         self._conn.commit()
+        ensure_lcm_file_permissions(self.db_path)
 
     def _ensure_source_window_columns(self) -> None:
         columns = {
@@ -207,6 +214,8 @@ class SummaryDAG:
 
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
+        summary = str(redact_sensitive_value(node.summary, self._ingest_protection_config) or "")
+        expand_hint = str(redact_sensitive_value(node.expand_hint, self._ingest_protection_config) or "")
         cur = self._conn.execute(
             """INSERT INTO summary_nodes
                (session_id, depth, summary, token_count, source_token_count,
@@ -215,7 +224,7 @@ class SummaryDAG:
             (
                 node.session_id,
                 node.depth,
-                node.summary,
+                summary,
                 node.token_count,
                 node.source_token_count,
                 json.dumps(node.source_ids),
@@ -223,10 +232,13 @@ class SummaryDAG:
                 node.created_at or time.time(),
                 node.earliest_at,
                 node.latest_at,
-                node.expand_hint,
+                expand_hint,
             ),
         )
         self._conn.commit()
+        ensure_lcm_file_permissions(self.db_path)
+        node.summary = summary
+        node.expand_hint = expand_hint
         node.node_id = cur.lastrowid
         return node.node_id
 
@@ -305,6 +317,66 @@ class SummaryDAG:
             (session_id, depth),
         ).fetchone()
         return row[0] if row else 0
+
+    def get_session_node_count(self, session_id: str) -> int:
+        """Count summary nodes for a session without loading node rows."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row[0] if row else 0)
+
+    def get_session_depth_stats(self, session_id: str) -> Dict[int, Dict[str, int]]:
+        """Aggregate per-depth node/token stats for a session."""
+        rows = self._conn.execute(
+            """SELECT depth,
+                      COUNT(*) AS count,
+                      COALESCE(SUM(token_count), 0) AS tokens,
+                      COALESCE(SUM(source_token_count), 0) AS source_tokens
+               FROM summary_nodes
+               WHERE session_id = ?
+               GROUP BY depth
+               ORDER BY depth""",
+            (session_id,),
+        ).fetchall()
+        return {
+            int(row[0]): {
+                "count": int(row[1] or 0),
+                "tokens": int(row[2] or 0),
+                "source_tokens": int(row[3] or 0),
+            }
+            for row in rows
+        }
+
+    def get_session_depth_samples(
+        self,
+        session_id: str,
+        *,
+        per_depth_limit: int = 20,
+        depths: List[int] | None = None,
+    ) -> Dict[int, List[SummaryNode]]:
+        """Return a bounded ordered sample of nodes per depth."""
+        if per_depth_limit <= 0:
+            return {}
+        if depths is None:
+            depth_rows = self._conn.execute(
+                """SELECT DISTINCT depth FROM summary_nodes
+                   WHERE session_id = ?
+                   ORDER BY depth""",
+                (session_id,),
+            ).fetchall()
+            depths = [int(row[0]) for row in depth_rows]
+
+        samples: Dict[int, List[SummaryNode]] = {}
+        for depth in depths:
+            rows = self._conn.execute(
+                """SELECT * FROM summary_nodes
+                   WHERE session_id = ? AND depth = ?
+                   ORDER BY created_at LIMIT ?""",
+                (session_id, depth, per_depth_limit),
+            ).fetchall()
+            samples[int(depth)] = [self._row_to_node(row) for row in rows]
+        return samples
 
     def get_uncondensed_at_depth(self, session_id: str, depth: int,
                                   limit: int = 100) -> List[SummaryNode]:

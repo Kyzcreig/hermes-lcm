@@ -25,7 +25,11 @@ from .db_bootstrap import (
     run_versioned_migrations,
 )
 from .config import LCMConfig
-from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
+from .ingest_protection import (
+    protect_message_for_ingest,
+    protect_messages_for_ingest,
+    redact_sensitive_value,
+)
 from .search_query import (
     build_snippet,
     compute_search_candidate_cap,
@@ -45,9 +49,34 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .storage_security import RowCipher, ensure_lcm_file_permissions
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_ts(value: Any) -> float:
+    """Resolve a message's timestamp for ingest.
+
+    Replayed rows (restored from the durable transcript) carry their real
+    arrival ``timestamp``; preserve it so a restart/session-bind replay does
+    not re-stamp the whole batch with one ``time.time()`` instant (the
+    timestamp-collapse bug). A genuinely-new live message has no usable
+    ``timestamp`` and falls back to now. Non-numeric / None / <=0 values are
+    treated as missing (a real message is never legitimately stamped 0) and
+    fall back to now — never crash, never write a 1970 epoch.
+    """
+    if value is None:
+        return time.time()
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return time.time()
+    # reject NaN / inf / non-positive
+    if ts > 0 and ts == ts and ts != float("inf"):
+        return ts
+    return time.time()
+
 
 
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
@@ -69,6 +98,15 @@ def _legacy_blank_source_clause(column: str) -> str:
 def _normalize_source_value(source: str | None) -> str:
     normalized = (source or "").strip()
     return normalized or _UNKNOWN_SOURCE
+
+
+def _index_safe_text(value: Any, config: LCMConfig) -> str | None:
+    redacted = redact_sensitive_value(value, config, parse_json_strings=False)
+    return _normalize_content_value(redacted)
+
+
+def _encrypted_or_plain(cipher: RowCipher, value: str | None, *, field: str) -> str | None:
+    return cipher.encrypt_text(value, field=field)
 
 
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
@@ -175,29 +213,29 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
         table_name="messages_fts",
         content_table="messages",
         content_rowid="store_id",
-        indexed_column="content",
+        indexed_column="search_content",
         trigger_sqls=(
             """
             CREATE TRIGGER IF NOT EXISTS msg_fts_insert
                 AFTER INSERT ON messages BEGIN
-                INSERT INTO messages_fts(rowid, content)
-                    VALUES (new.store_id, new.content);
+                INSERT INTO messages_fts(rowid, search_content)
+                    VALUES (new.store_id, new.search_content);
             END;
             """,
             """
             CREATE TRIGGER IF NOT EXISTS msg_fts_delete
                 AFTER DELETE ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, content)
-                    VALUES('delete', old.store_id, old.content);
+                INSERT INTO messages_fts(messages_fts, rowid, search_content)
+                    VALUES('delete', old.store_id, old.search_content);
             END;
             """,
             """
             CREATE TRIGGER IF NOT EXISTS msg_fts_update
-                AFTER UPDATE OF content ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, content)
-                    VALUES('delete', old.store_id, old.content);
-                INSERT INTO messages_fts(rowid, content)
-                    VALUES (new.store_id, new.content);
+                AFTER UPDATE OF search_content ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, search_content)
+                    VALUES('delete', old.store_id, old.search_content);
+                INSERT INTO messages_fts(rowid, search_content)
+                    VALUES (new.store_id, new.search_content);
             END;
             """,
         ),
@@ -209,9 +247,15 @@ class MessageStore:
 
     def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_lcm_file_permissions(self.db_path)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
+        self._cipher = RowCipher.from_config(
+            self._ingest_protection_config,
+            hermes_home=self._hermes_home,
+            db_path=self.db_path,
+        )
         self._conn: Optional[sqlite3.Connection] = None
         # ``self._conn`` is shared across threads (the connection is opened with
         # ``check_same_thread=False``). SQLite's own C-level mutex serializes
@@ -242,6 +286,7 @@ class MessageStore:
                 source TEXT DEFAULT '',
                 role TEXT NOT NULL,
                 content TEXT,
+                search_content TEXT,
                 tool_call_id TEXT,
                 tool_calls TEXT,
                 tool_name TEXT,
@@ -259,13 +304,64 @@ class MessageStore:
                 value TEXT
             );
         """)
+        # Init ordering is load-bearing, both ways (2026-07-25 incident):
+        #  1. ADD the search_content column first (bare ALTER; fires no
+        #     triggers) — the FTS rebuild below reads it from `messages`,
+        #     so a never-migrated DB needs the column to exist.
+        #  2. THEN repair/verify the FTS table + triggers, BEFORE any UPDATE
+        #     that can fire them — on a drifted messages_fts (old `content`
+        #     virtual-table column under new `search_content` triggers) the
+        #     backfill UPDATE raises and kills engine construction before
+        #     the self-heal ever runs (live fleet: every session silently
+        #     fell back to the built-in compressor).
+        #  3. Only then run the backfill UPDATE over legacy NULL rows.
+        self._ensure_search_content_column()
         ensure_external_content_fts(
             self._conn,
             build_message_fts_spec(),
         )
+        self._backfill_search_content()
         run_versioned_migrations(self._conn)
         self._ensure_source_column()
         self._conn.commit()
+        ensure_lcm_file_permissions(self.db_path)
+
+    def _ensure_search_content_column(self) -> None:
+        """Add the ``search_content`` column if missing (split from the
+        backfill so the FTS self-heal can run between them — see init)."""
+        assert self._conn is not None
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "search_content" not in columns:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN search_content TEXT")
+
+    def _backfill_search_content(self) -> None:
+        """Backfill NULL ``search_content`` rows. Runs AFTER the FTS self-heal
+        because these UPDATEs fire ``msg_fts_update``."""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT store_id, content FROM messages WHERE search_content IS NULL"
+        ).fetchall()
+        for store_id, content in rows:
+            try:
+                plain_content = self._cipher.decrypt_text(content, field="content")
+                search_content = _index_safe_text(plain_content, self._ingest_protection_config)
+            except RuntimeError:
+                search_content = None
+            self._conn.execute(
+                "UPDATE messages SET search_content = ? WHERE store_id = ?",
+                (search_content, store_id),
+            )
+
+    def _ensure_storage_columns(self) -> None:
+        """Back-compat shim: column-add + backfill in one call (old order).
+
+        Init no longer calls this (it needs the FTS self-heal between the two
+        halves); kept for any external caller.
+        """
+        self._ensure_search_content_column()
+        self._backfill_search_content()
 
     def _ensure_source_column(self) -> None:
         columns = {
@@ -290,27 +386,33 @@ class MessageStore:
         )
         tool_calls = msg.get("tool_calls")
         tc_json = json.dumps(tool_calls) if tool_calls else None
+        content_plain = _normalize_content_value(msg.get("content"))
+        search_content = _index_safe_text(msg.get("content"), self._ingest_protection_config)
+        content_stored = _encrypted_or_plain(self._cipher, content_plain, field="content")
+        tool_calls_stored = _encrypted_or_plain(self._cipher, tc_json, field="tool_calls")
 
         with self._write_lock:
             cur = self._conn.execute(
                 """INSERT INTO messages
-                   (session_id, source, role, content, tool_call_id, tool_calls,
+                   (session_id, source, role, content, search_content, tool_call_id, tool_calls,
                     tool_name, timestamp, token_estimate, pinned)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     _normalize_source_value(source),
                     msg.get("role", "unknown"),
-                    _normalize_content_value(msg.get("content")),
+                    content_stored,
+                    search_content,
                     msg.get("tool_call_id"),
-                    tc_json,
+                    tool_calls_stored,
                     msg.get("tool_name"),
-                    time.time(),
+                    _coerce_ts(msg.get("timestamp")),
                     token_estimate,
                     0,
                 ),
             )
             self._conn.commit()
+            ensure_lcm_file_permissions(self.db_path)
             return cur.lastrowid
 
     def append_batch(self, session_id: str,
@@ -329,30 +431,41 @@ class MessageStore:
         )
 
         ids = []
-        ts = time.time()
         with self._write_lock, self._conn:
-            for msg, est in zip(protected_messages, token_estimates):
+            for msg, est, original_msg in zip(protected_messages, token_estimates, messages):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
+                content_plain = _normalize_content_value(msg.get("content"))
+                search_content = _index_safe_text(msg.get("content"), self._ingest_protection_config)
+                content_stored = _encrypted_or_plain(self._cipher, content_plain, field="content")
+                tool_calls_stored = _encrypted_or_plain(self._cipher, tc_json, field="tool_calls")
+                # Per-row timestamp: a replayed row carries its real arrival time;
+                # read it from the protected msg, falling back to the original
+                # (the protection transform may not retain the key) then to now.
+                row_ts = _coerce_ts(
+                    msg.get("timestamp", original_msg.get("timestamp"))
+                )
                 cur = self._conn.execute(
                     """INSERT INTO messages
-                       (session_id, source, role, content, tool_call_id, tool_calls,
+                       (session_id, source, role, content, search_content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
                         msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
+                        content_stored,
+                        search_content,
                         msg.get("tool_call_id"),
-                        tc_json,
+                        tool_calls_stored,
                         msg.get("tool_name"),
-                        ts,
+                        row_ts,
                         est,
                         0,
                     ),
                 )
                 ids.append(cur.lastrowid)
+        ensure_lcm_file_permissions(self.db_path)
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
@@ -388,7 +501,11 @@ class MessageStore:
             if row is None:
                 return False
             role, pinned, current_content, tool_call_id = row
-            if role != "tool" or bool(pinned) or current_content == placeholder:
+            try:
+                current_plain = self._cipher.decrypt_text(current_content, field="content")
+            except RuntimeError:
+                current_plain = current_content
+            if role != "tool" or bool(pinned) or current_plain == placeholder:
                 return False
             placeholder_tokens = count_message_tokens(
                 {
@@ -398,10 +515,16 @@ class MessageStore:
                 }
             )
             self._conn.execute(
-                "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
-                (placeholder, placeholder_tokens, store_id),
+                "UPDATE messages SET content = ?, search_content = ?, token_estimate = ? WHERE store_id = ?",
+                (
+                    _encrypted_or_plain(self._cipher, placeholder, field="content"),
+                    _index_safe_text(placeholder, self._ingest_protection_config),
+                    placeholder_tokens,
+                    store_id,
+                ),
             )
             self._conn.commit()
+            ensure_lcm_file_permissions(self.db_path)
             return True
 
     def pin(self, store_id: int) -> None:
@@ -546,6 +669,18 @@ class MessageStore:
                WHERE session_id = ?
                ORDER BY store_id LIMIT ?""",
             (session_id, limit),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def get_session_messages_after(self, session_id: str,
+                                   after_store_id: int = 0,
+                                   limit: int = 10000) -> List[Dict[str, Any]]:
+        """Get session messages after a store_id, ordered by store_id."""
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+               WHERE session_id = ? AND store_id > ?
+               ORDER BY store_id LIMIT ?""",
+            (session_id, after_store_id, limit),
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -716,6 +851,9 @@ class MessageStore:
             try:
                 where = ["messages_fts MATCH ?"]
                 args: list[Any] = [safe_query]
+                # Exclude replay-dedup soft-hidden rows so a re-ingested copy
+                # never resurfaces as a duplicate search hit (v5 column).
+                where.append("m.superseded_by IS NULL")
                 if session_id is not None:
                     where.append("m.session_id = ?")
                     args.append(session_id)
@@ -802,7 +940,7 @@ class MessageStore:
             return []
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
 
-        where: list[str] = ["content IS NOT NULL"]
+        where: list[str] = ["search_content IS NOT NULL", "superseded_by IS NULL"]
         args: list[Any] = []
         if session_id is not None:
             where.append("session_id = ?")
@@ -822,7 +960,7 @@ class MessageStore:
             args.append(time_to)
         like_clauses = []
         for term in terms:
-            like_clauses.append("content LIKE ? ESCAPE '\\'")
+            like_clauses.append("search_content LIKE ? ESCAPE '\\'")
             args.append(f"%{escape_like(term)}%")
         where.append("(" + " OR ".join(like_clauses) + ")")
         fetch_limit = compute_like_fallback_fetch_limit(limit, terms, phrases)
@@ -837,7 +975,7 @@ class MessageStore:
 
             def count_expr(term: str) -> tuple[str, list[Any]]:
                 return (
-                    "((LENGTH(LOWER(content)) - LENGTH(REPLACE(LOWER(content), LOWER(?), ''))) "
+                    "((LENGTH(LOWER(search_content)) - LENGTH(REPLACE(LOWER(search_content), LOWER(?), ''))) "
                     "/ NULLIF(LENGTH(?), 0))",
                     [term, term],
                 )
@@ -845,7 +983,7 @@ class MessageStore:
             score_exprs: list[str] = []
             for term in terms:
                 if collapse_risky_repeats:
-                    score_exprs.append("CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END")
+                    score_exprs.append("CASE WHEN search_content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END")
                     order_args.append(f"%{escape_like(term)}%")
                 else:
                     expr, expr_args = count_expr(term)
@@ -878,7 +1016,7 @@ class MessageStore:
             if phrases:
                 phrase_hit_exprs: list[str] = []
                 for phrase in phrases:
-                    phrase_hit_exprs.append("CASE WHEN INSTR(LOWER(content), LOWER(?)) > 0 THEN 1 ELSE 0 END")
+                    phrase_hit_exprs.append("CASE WHEN INSTR(LOWER(search_content), LOWER(?)) > 0 THEN 1 ELSE 0 END")
                     directness_args.append(phrase)
                 phrase_hit_expr = " + ".join(phrase_hit_exprs) if phrase_hit_exprs else "0"
                 non_phrase_terms = [term for term in terms if term.strip().lower() not in normalized_phrases]
@@ -904,7 +1042,8 @@ class MessageStore:
         def add_rows(rows: list[sqlite3.Row]) -> None:
             for row in rows:
                 result = self._row_to_dict(row)
-                content = result.get("content") or ""
+                search_text = row[11] if len(row) > 11 else result.get("content")
+                content = str(search_text or "")
                 score = sum(
                     min(count_term_matches(content, term), 1) if collapse_risky_repeats else count_term_matches(content, term)
                     for term in terms
@@ -926,7 +1065,7 @@ class MessageStore:
                 if batch_limit <= 0:
                     break
                 rows = self._conn.execute(
-                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}, search_content
                         FROM messages
                         WHERE {' AND '.join(where)}
                         {order_by}
@@ -943,7 +1082,7 @@ class MessageStore:
                     boundary_role_bias = _message_role_bias(rows[-1][3])
                     while True:
                         tie_rows = self._conn.execute(
-                            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                            f"""SELECT {_MESSAGE_SELECT_COLUMNS}, search_content
                                 FROM messages
                                 WHERE {' AND '.join(where)}
                                 {order_by}
@@ -967,7 +1106,7 @@ class MessageStore:
                     break
         else:
             rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS}, search_content
                     FROM messages
                     WHERE {' AND '.join(where)}
                     LIMIT ?""",
@@ -992,10 +1131,13 @@ class MessageStore:
         ]
         d = dict(zip(cols, row[:len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))
+        d["content"] = self._cipher.decrypt_text(d.get("content"), field="content")
+        d["tool_calls"] = self._cipher.decrypt_text(d.get("tool_calls"), field="tool_calls")
         # Deserialize tool_calls JSON
-        if d.get("tool_calls"):
+        tool_calls_value = d.get("tool_calls")
+        if isinstance(tool_calls_value, str) and tool_calls_value:
             try:
-                d["tool_calls"] = json.loads(d["tool_calls"])
+                d["tool_calls"] = json.loads(tool_calls_value)
             except (json.JSONDecodeError, TypeError):
                 pass
         return d

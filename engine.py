@@ -33,12 +33,12 @@ from .externalize import (
     find_externalized_payload_for_message,
     load_externalized_payload,
     maybe_externalize_tool_output,
-    reassign_externalized_payloads,
 )
 from .extraction import (
     extract_before_compaction,
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
+    strip_injected_context_blocks,
 )
 from .ingest_protection import (
     _json_has_duplicate_object_keys,
@@ -73,6 +73,7 @@ from .message_content import (
     text_content_for_pattern_matching,
 )
 from .store import MessageStore
+from .storage_security import plaintext_path_policy, retention_status
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -81,6 +82,16 @@ logger = logging.getLogger(__name__)
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _PLUGIN_METADATA: dict[str, str] | None = None
 _SESSION_END_BUSY_TIMEOUT_MS = 50
+_FAIL_OPEN_RATE_WINDOW_SECONDS = 300.0
+
+
+class LCMFailOpenRecoveryError(RuntimeError):
+    """Raised when fail-open fallback cannot keep the next request under context."""
+
+    recoverable = True
+    compression_exhausted = True
+
+
 _VISIBLE_TEXT_PART_TYPES = {"text", "input_text", "output_text"}
 _INTERNAL_ASSISTANT_PART_TYPES = {
     "analysis",
@@ -258,6 +269,79 @@ def _is_synthetic_assistant_noise(content: str) -> bool:
     return normalized in _SYNTHETIC_ASSISTANT_NOISE or bracketless in _SYNTHETIC_ASSISTANT_NOISE
 
 
+def _is_codex_interim(msg: Dict[str, Any]) -> bool:
+    """A Codex Responses interim assistant turn.
+
+    These legitimately keep multiple consecutive incomplete assistant turns in
+    history, each carrying its own encrypted continuation state
+    (``codex_reasoning_items`` / ``codex_message_items``) that must replay
+    verbatim. Merging them corrupts the Responses replay chain — so the
+    adjacent-assistant merge exempts them, exactly as the gateway's
+    ``repair_message_sequence`` (agent/agent_runtime_helpers.py) does.
+    """
+    return bool(
+        msg.get("codex_reasoning_items")
+        or msg.get("codex_message_items")
+        or msg.get("finish_reason") == "incomplete"
+    )
+
+
+def _merge_adjacent_assistant_messages(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge consecutive assistant messages into one (alternation repair).
+
+    LCM's active-context assembly strips ``tool_calls`` off assistant turns and
+    drops their ``tool`` results to shed token-heavy scaffolding. That leaves
+    the narration rows that used to be separated by tool results sitting
+    adjacent — a strict-alternation violation (``assistant`` followed by
+    ``assistant``) that every downstream load then has to repair, and that
+    inflates the persisted ``message_count`` above the count the model actually
+    replays. Collapse them here, at the single active-context funnel, so the
+    emitted (and persisted) context is alternation-clean by construction.
+
+    Mirrors ``repair_message_sequence`` Pass 0 in the gateway: union tool_calls
+    (order-preserving), concatenate plain-text content, carry the first
+    non-empty ``reasoning_content``, and exempt Codex Responses interim turns.
+    The raw store and DAG are untouched (this operates only on the active
+    replay list), so recovery granularity is preserved.
+    """
+    collapsed: List[Dict[str, Any]] = []
+    for msg in messages:
+        if (
+            collapsed
+            and isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and isinstance(collapsed[-1], dict)
+            and collapsed[-1].get("role") == "assistant"
+            and not _is_codex_interim(msg)
+            and not _is_codex_interim(collapsed[-1])
+        ):
+            prev = dict(collapsed[-1])
+            prev_calls = list(prev.get("tool_calls") or [])
+            new_calls = list(msg.get("tool_calls") or [])
+            if new_calls:
+                prev["tool_calls"] = prev_calls + new_calls
+            elif prev_calls:
+                prev["tool_calls"] = prev_calls
+            prev_content = prev.get("content")
+            new_content = msg.get("content")
+            if isinstance(prev_content, str) and isinstance(new_content, str):
+                prev["content"] = "\n".join(
+                    part
+                    for part in (prev_content.strip(), new_content.strip())
+                    if part
+                )
+            elif not prev_content and new_content is not None:
+                prev["content"] = new_content
+            if not prev.get("reasoning_content") and msg.get("reasoning_content"):
+                prev["reasoning_content"] = msg["reasoning_content"]
+            collapsed[-1] = prev
+            continue
+        collapsed.append(msg)
+    return collapsed
+
+
 class LCMEngine(ContextEngine):
     """Lossless Context Management engine.
 
@@ -342,6 +426,11 @@ class LCMEngine(ContextEngine):
         self._update_model_pending_session_start = False
         self.threshold_tokens = 0
         self.threshold_percent = self._config.context_threshold
+        # P2 calibration knobs (read by the ContextEngine ABC calibration methods
+        # via getattr). Sourced ONCE here from this engine's own config so the
+        # process-global singleton is never mutated per-agent (Greptile PR #111).
+        self._skew_floor = self._config.skew_floor
+        self._hard_frac = self._config.calibration_hard_frac
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -352,9 +441,19 @@ class LCMEngine(ContextEngine):
         self.last_reasoning_tokens = 0
         self.cache_metrics_available = False
         self.compression_count = 0
+        # Leaf-pass count of the most recent compress() that reached assembly;
+        # the in-turn stats consumer reads this to decide provenance trust
+        # (single-pass = trusted; multi-pass = shadow until PR-C).
+        self.last_leaf_passes = 0
         # run_agent.py reads these for preflight checks
         self.protect_first_n = 3
         self.protect_last_n = self._config.fresh_tail_count
+        # Token-budgeted fresh tail (compression.target_ratio support).
+        # Budget is derived when a context window is known (_set_context_length);
+        # 0 = legacy fixed-count tail. _last_fresh_tail_count tracks the dynamic
+        # count actually used by the most recent compress() pass (D-7 rotate floor).
+        self._fresh_tail_token_budget = 0
+        self._last_fresh_tail_count = self._config.fresh_tail_count
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
@@ -362,6 +461,12 @@ class LCMEngine(ContextEngine):
         # silent maintenance. Manual /lcm diagnostics and warning/error paths
         # remain explicit.
         self.emit_automatic_compaction_status = False
+        # ...but the in-chat compaction ANNOUNCE stays ON: LCM moves raw turns
+        # out of the live context into lcm.db, and the announce is the only
+        # place the user is told they are recoverable (lcm_grep / lcm_expand).
+        # Silencing it would make LCM compaction look lossy. Explicit True
+        # (not inherit) — see ContextEngine.emit_automatic_compaction_announce.
+        self.emit_automatic_compaction_announce = True
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
         self._summary_circuit_breaker = SummaryCircuitBreaker(
@@ -370,8 +475,24 @@ class LCMEngine(ContextEngine):
         )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        self._last_condensations = []
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        self._degraded = False
+        self._last_degraded_reason = ""
+        self._last_fail_open_at = 0.0
+        self._last_fail_open_error = ""
+        self._last_fail_open_error_type = ""
+        self._last_fail_open_fallback_error = ""
+        self._last_fail_open_fallback_error_type = ""
+        self._last_fail_open_raw_tokens = 0
+        self._last_fail_open_context_limit = 0
+        self._last_fail_open_over_context_limit = False
+        self._last_fail_open_fallback_attempted = False
+        self._last_fail_open_fallback_status = ""
+        self._fail_open_total_count = 0
+        self._fail_open_consecutive_count = 0
+        self._fail_open_timestamps: list[float] = []
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
@@ -407,13 +528,36 @@ class LCMEngine(ContextEngine):
             hermes_home=self._hermes_home,
         )
 
+    def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
+        """Copy the plugin runtime without pickling SQLite-backed helpers.
+
+        Hermes core may deepcopy plugin context engines while creating isolated
+        AIAgent instances. A default object deepcopy walks into MessageStore,
+        SummaryDAG, and LifecycleStateStore sqlite3.Connection handles, which
+        cannot be pickled. LCM already exposes clone_for_agent() as the safe
+        boundary: share durable configuration/database path, but allocate fresh
+        per-agent runtime/storage helper objects.
+        """
+        clone = self.clone_for_agent()
+        memo[id(self)] = clone
+        return clone
+
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
         """Resolve the SQLite path for the active Hermes profile/home."""
         if self._config.database_path:
             return Path(self._config.database_path)
         if hermes_home:
             return Path(hermes_home) / "lcm.db"
-        return Path.home() / ".hermes" / "lcm.db"
+        # Final fallback must respect a redirected HERMES_HOME — a bare
+        # Path.home()/".hermes" opens the PROD lcm.db under hermetic runs
+        # (same freeze class as the 2026-07-24 DEFAULT_DB_PATH incident /
+        # t_43d5c42d). config.py in this package already uses this form.
+        env_home = os.environ.get("HERMES_HOME")
+        if env_home:
+            return Path(env_home) / "lcm.db"
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "lcm.db"
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
@@ -422,7 +566,7 @@ class LCMEngine(ContextEngine):
             ingest_protection_config=self._config,
             hermes_home=hermes_home,
         )
-        self._dag = SummaryDAG(db_path)
+        self._dag = SummaryDAG(db_path, ingest_protection_config=self._config)
         self._lifecycle = LifecycleStateStore(db_path)
 
     def _close_storage(self) -> None:
@@ -510,7 +654,73 @@ class LCMEngine(ContextEngine):
         self.threshold_tokens = int(
             parsed_context_length * self._config.context_threshold
         )
+        self._refresh_fresh_tail_token_budget()
         return True
+
+    def _refresh_fresh_tail_token_budget(self) -> None:
+        """Recompute the token-budgeted fresh-tail target (D-11/I-2/I-4).
+
+        budget = target_ratio × threshold_tokens (or the explicit
+        ``fresh_tail_token_budget`` override), capped at
+        ``fresh_tail_max_tokens`` and at 0.9 × threshold_tokens (convergence
+        clamp: compaction must always be able to shrink the context below the
+        trigger). Any degenerate input leaves the budget at 0 → legacy
+        fixed-count tail.
+        """
+        self._fresh_tail_token_budget = 0
+        try:
+            if not self._config.fresh_tail_token_budget_enabled:
+                return
+            if self.threshold_tokens <= 0:
+                return
+            explicit = int(self._config.fresh_tail_token_budget or 0)
+            budget = explicit if explicit > 0 else int(
+                self._config.target_ratio * self.threshold_tokens
+            )
+            caps = [budget, int(0.9 * self.threshold_tokens)]
+            max_tokens = int(self._config.fresh_tail_max_tokens or 0)
+            if max_tokens > 0:
+                caps.append(max_tokens)
+            self._fresh_tail_token_budget = max(0, min(caps))
+        except Exception:
+            self._fresh_tail_token_budget = 0
+
+    def _dynamic_fresh_tail_count(self, messages: List[Dict[str, Any]]) -> int:
+        """Message count for the fresh tail under the token budget (D-11).
+
+        Walks backward from the newest message accumulating estimated tokens
+        (``count_message_tokens``) until the budget is spent. Floored at the
+        legacy ``fresh_tail_count`` (I-3) so the tail is never smaller than
+        today's fixed count; any error or degenerate budget reproduces the
+        legacy count exactly (I-4).
+        """
+        base = max(1, int(self._config.fresh_tail_count))
+        budget = getattr(self, "_fresh_tail_token_budget", 0)
+        if budget <= 0:
+            return base
+        try:
+            used = 0
+            count = 0
+            for msg in reversed(messages):
+                msg_tokens = count_message_tokens(msg)
+                if used + msg_tokens > budget and count >= base:
+                    break
+                used += msg_tokens
+                count += 1
+            # NOTE (pass-3 B-NEW-2, ground-truthed): the result may exceed
+            # len(messages) on a short list — that is the LEGACY semantic
+            # (protect_last_n is a constant fresh_tail_count today regardless
+            # of list length) and every consumer already clamps:
+            # _fresh_tail_start floors the cut at 0, and
+            # find_inturn_kept_cut computes lo = max(0, n - count - slack).
+            # Clamping here would CHANGE legacy behavior on short lists (I-4).
+            return max(base, count)
+        except Exception:
+            return base
+
+    def _fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
+        """Index where the fresh tail begins (single chokepoint, I-5)."""
+        return max(0, len(messages) - self._dynamic_fresh_tail_count(messages))
 
     def _session_metadata_matches_active_runtime(
         self,
@@ -619,6 +829,12 @@ class LCMEngine(ContextEngine):
         self.last_cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
         self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+        # Pair the skew (P2 "compact on the truth" calibration) — the real
+        # prompt_tokens / the rough estimate stashed for this request. Recorded on
+        # the shared ContextEngine base so should_compress_calibrated can scale the
+        # rough estimate to the provider's real accounting.
+        if self.last_prompt_tokens > 0:
+            self.record_skew_from_real(self.last_prompt_tokens)
 
     @property
     def cache_read_ratio(self) -> float:
@@ -703,7 +919,7 @@ class LCMEngine(ContextEngine):
         if not messages:
             return False, "empty message list"
         n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return False, "no eligible raw backlog outside fresh tail"
@@ -841,9 +1057,39 @@ class LCMEngine(ContextEngine):
         raise RuntimeError("adaptive leaf rescue exhausted without a valid chunk")
 
     def compress(self, messages: List[Dict[str, Any]],
-                 current_tokens: int = None,
-                 focus_topic: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Main compaction entry point.
+                 current_tokens: Optional[int] = None,
+                 focus_topic: Optional[str] = None,
+                 force: bool = False,
+                 memory_context: str = "") -> List[Dict[str, Any]]:
+        """Main compaction entry point with fail-open degraded handling.
+
+        ``force`` and ``memory_context`` are part of the ContextEngine ABC
+        contract. LCM has no engine-owned cooldown to bypass and builds its
+        own lossless handoff, so both are accepted for signature parity and
+        intentionally ignored.
+        """
+        try:
+            compressed = self._compress_lossless(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+            )
+        except LCMFailOpenRecoveryError:
+            raise
+        except Exception as exc:
+            return self._handle_fail_open_compression_exception(
+                messages,
+                exc,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+            )
+        self._mark_compression_not_degraded()
+        return compressed
+
+    def _compress_lossless(self, messages: List[Dict[str, Any]],
+                           current_tokens: Optional[int] = None,
+                           focus_topic: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Main compaction implementation.
 
         1. Ingest any new messages into the store
         2. Identify messages outside the fresh tail
@@ -896,8 +1142,24 @@ class LCMEngine(ContextEngine):
         working_messages = self._ingest_messages(messages)
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
+        # Frozen-K (D-11): the dynamic fresh-tail count is computed ONCE per
+        # compress() pass, on the post-ingest working list. Every in-pass cut
+        # uses `len(current_list) - K`, which names the same physical tail rows
+        # at each site because the leaf loop only REMOVES rows from the front
+        # region (scaffold-drop / compacted-chunk removal); the only
+        # list-growing transform (_sanitize_active_context_messages stub
+        # insertion) runs strictly after the last cut, on the already-cut tail.
+        frozen_fresh_tail_count = self._dynamic_fresh_tail_count(working_messages)
+        self._last_fresh_tail_count = frozen_fresh_tail_count
+        self.protect_last_n = frozen_fresh_tail_count
         leaf_compacted_this_turn = False
+        dropped_replayed_scaffold_messages = False
         leaf_passes = 0
+        # Per-event node accounting for the compaction summary line: snapshot the
+        # session's DAG node count BEFORE this event so the log can report how many
+        # nodes THIS compress built (delta), not just the lifetime total — the
+        # lifetime figure alone misleads (a 22-day session shows 63 while building 3).
+        nodes_before = len(self._dag.get_session_nodes(self._session_id))
         critical_budget_pressure = self._critical_budget_pressure_reached(
             observed_tokens=observed_prompt_tokens,
             messages=working_messages,
@@ -924,7 +1186,7 @@ class LCMEngine(ContextEngine):
 
         while leaf_passes < max_leaf_passes:
             n = len(working_messages)
-            fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+            fresh_tail_start = max(0, n - frozen_fresh_tail_count)
 
             # Keep only a real system prompt anchored. Gateway sessions may
             # pass only conversation messages, so index 0 can be an old user
@@ -934,6 +1196,22 @@ class LCMEngine(ContextEngine):
             if fresh_tail_start <= leading_anchor_count:
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 break
+
+            candidate_start = leading_anchor_count
+            while (
+                candidate_start < fresh_tail_start
+                and self._is_replayed_context_scaffold_message(working_messages[candidate_start])
+            ):
+                candidate_start += 1
+            if candidate_start > leading_anchor_count:
+                dropped_replayed_scaffold_messages = True
+                working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
+                pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[candidate_start:]
+                n = len(working_messages)
+                fresh_tail_start = max(0, n - frozen_fresh_tail_count)
+                if fresh_tail_start <= leading_anchor_count:
+                    noop_reason = "selected leaf chunk lacks raw store lineage"
+                    break
 
             candidate_raw = working_messages[leading_anchor_count:fresh_tail_start]
             if not candidate_raw:
@@ -1014,12 +1292,12 @@ class LCMEngine(ContextEngine):
                     break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 remaining_raw = working_messages[
-                    leading_anchor_count:max(0, len(working_messages) - self._config.fresh_tail_count)
+                    leading_anchor_count:max(0, len(working_messages) - frozen_fresh_tail_count)
                 ]
                 if not remaining_raw:
                     break
                 pressure_remaining_raw = pressure_messages[
-                    leading_anchor_count:max(0, len(pressure_messages) - self._config.fresh_tail_count)
+                    leading_anchor_count:max(0, len(pressure_messages) - frozen_fresh_tail_count)
                 ]
                 remaining_raw_tokens = count_messages_tokens(pressure_remaining_raw)
                 remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)
@@ -1044,20 +1322,38 @@ class LCMEngine(ContextEngine):
                     compressed,
                     assembly_cap_override=recovery_assembly_cap,
                 )
-            sanitized_messages = self._sanitize_active_context_messages(
-                working_messages,
-                insert_missing_tool_stubs=False,
-            )
+            if dropped_replayed_scaffold_messages:
+                leading_anchor_count = self._leading_anchor_count(working_messages)
+                anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
+                self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
+                try:
+                    sanitized_messages = self._assemble_context(
+                        working_messages[0] if leading_anchor_count else None,
+                        working_messages[leading_anchor_count:],
+                        assembly_cap_override=recovery_assembly_cap,
+                    )
+                finally:
+                    self._pending_context_anchor_messages = None
+            else:
+                sanitized_messages = self._sanitize_active_context_messages(
+                    working_messages,
+                    insert_missing_tool_stubs=False,
+                )
             if sanitized_messages != working_messages:
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from a sanitized
-                # context, keeping the old cursor could make the next appended
-                # messages look already ingested. This applies to content-only
-                # cleanup as well as dropped-message cleanup.
+                # or reassembled context, keeping the old cursor could make the
+                # next appended messages look already ingested. This applies to
+                # content-only cleanup as well as dropped-message cleanup.
                 self._ingest_cursor = len(sanitized_messages)
                 self._last_compression_status = "sanitized"
                 self._last_compression_noop_reason = ""
             else:
+                if dropped_replayed_scaffold_messages:
+                    # The active context changed even though no new leaf node was
+                    # written. Keep the cursor aligned with the returned context
+                    # so the next appended turn is ingested instead of skipped.
+                    self._ingest_cursor = len(sanitized_messages)
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = noop_reason
                 logger.info("LCM compression no-op: %s", noop_reason)
@@ -1079,10 +1375,63 @@ class LCMEngine(ContextEngine):
         leading_anchor_count = self._leading_anchor_count(working_messages)
         anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
         self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
+        # ── Option B provenance stamp (all leaf passes) ───────────────────────────
+        # Stamp each fresh-tail row handed to _assemble_context with `_src_idx` = its
+        # index into the ORIGINAL `messages`, so the in-turn compaction-stats consumer
+        # can read the EXACT pre-side kept partition off the returned `compressed` (the
+        # rows' shallow-copies carry the key through every sanitize/trim/rewrite stage
+        # by construction; synthetic stubs lack it). The fresh tail is a SUFFIX of the
+        # original `messages` for ANY number of leaf passes (spec 2026-07-02 §0.6,
+        # five-step proof): (1) ingest is a 1:1 order-preserving rewrite; (2) every
+        # in-loop mutation removes rows ONLY from the front region — scaffold drop and
+        # compacted-chunk removal both slice strictly before fresh_tail_start, and
+        # _select_oldest_leaf_chunk picks a contiguous FRONT prefix; (3) summary rows
+        # go to the DAG (_dag.add_node), NEVER into working_messages — summaries are
+        # prepended inside _assemble_context, after this stamp; (4) frozen-K: the tail
+        # count is computed once per compress(), so "the last K rows" names the same
+        # physical rows after every pass; (4b) the stub-inserting sanitize runs ONLY
+        # inside/after _assemble_context — i.e. strictly after this stamp — so a stub
+        # can never shift the end-anchored index. Hence a tail row at offset `off`
+        # maps to `messages[len(messages) - (len(tail) - off)]` regardless of how much
+        # the front shrank or how many passes removed it (end-anchored indexing —
+        # Greptile #110 flagged working-position indexing would never engage
+        # post-fold). Guarded per-row on role + tool_call_id + tool_calls arity
+        # (structural fields that survive content rewrites); the consumer is the real
+        # gate — harvest validates indices in-range + no-dup and the reconcile check
+        # falls to the A-floor if anything is off, so a wrong stamp can never ship a
+        # confidently-wrong split. Multi-pass consumption is SHADOW-ONLY until PR-C
+        # (the consumer displays current behavior and logs agree/diverge). The
+        # consumer harvests then STRIPS `_src_idx` before `compressed` flows onward;
+        # `_`-prefixed = transport-stripped as a backstop.
+        self.last_leaf_passes = leaf_passes
+        tail_rows = working_messages[leading_anchor_count:]
+        if leaf_passes >= 1 and tail_rows and len(tail_rows) <= len(messages):
+            n_msgs = len(messages)
+            n_tail = len(tail_rows)
+            stamped_tail = []
+            for off, row in enumerate(tail_rows):
+                src_idx = n_msgs - (n_tail - off)
+                # ingest SHALLOW-COPIES rows, so an `is` identity check would never
+                # match (Greptile #110): guard on structural fields instead. Content
+                # may be quarantine/redact-rewritten; role, tool_call_id, and
+                # tool_calls arity survive those 1:1 rewrites.
+                if (
+                    isinstance(row, dict)
+                    and 0 <= src_idx < n_msgs
+                    and isinstance(messages[src_idx], dict)
+                    and messages[src_idx].get("role") == row.get("role")
+                    and messages[src_idx].get("tool_call_id") == row.get("tool_call_id")
+                    and len(messages[src_idx].get("tool_calls") or [])
+                    == len(row.get("tool_calls") or [])
+                ):
+                    row = dict(row)
+                    row["_src_idx"] = src_idx
+                stamped_tail.append(row)
+            tail_rows = stamped_tail
         try:
             compressed = self._assemble_context(
                 working_messages[0] if leading_anchor_count else None,
-                working_messages[leading_anchor_count:],
+                tail_rows,
                 assembly_cap_override=recovery_assembly_cap,
             )
         finally:
@@ -1105,8 +1454,24 @@ class LCMEngine(ContextEngine):
         self._ingest_cursor = len(compressed)
         self._ingest_cursor_needs_reconcile = False
 
+        # Per-event node accounting: nodes THIS compress built = current total minus
+        # the pre-event snapshot. The lifetime total is kept in parens because it was
+        # the only figure the old line reported and it silently misled debugging (a
+        # long-lived session shows a large total while a single event builds a few).
+        nodes_after = len(self._dag.get_session_nodes(self._session_id))
+        nodes_built = max(0, nodes_after - nodes_before)
+        condensations = getattr(self, "_last_condensations", None) or []
+        cascade_note = ""
+        if condensations:
+            # e.g. " condense=[d0→d1,d1→d2]" — the multi-level cascade is the dominant
+            # driver of a slow compress (each level is its own summarization pass);
+            # surfacing it inline turns "why was this slow" into one grep.
+            cascade_note = " condense=[%s]" % ",".join(
+                "d%d\u2192d%d" % (frm, to) for frm, to in condensations
+            )
         logger.info(
-            "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, %d DAG nodes%s)",
+            "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, "
+            "+%d nodes built (%d total)%s%s)",
             self.compression_count,
             len(messages),
             len(compressed),
@@ -1114,7 +1479,9 @@ class LCMEngine(ContextEngine):
             "es" if leaf_passes != 1 else "",
             count_messages_tokens(messages),
             count_messages_tokens(compressed),
-            len(self._dag.get_session_nodes(self._session_id)),
+            nodes_built,
+            nodes_after,
+            cascade_note,
             ", forced overflow recovery" if force_overflow else "",
         )
 
@@ -1124,6 +1491,215 @@ class LCMEngine(ContextEngine):
         compressed = self._sanitize_active_context_messages(compressed)
 
         return compressed
+
+    def _mark_compression_not_degraded(self) -> None:
+        self._degraded = False
+        self._last_degraded_reason = ""
+        self._fail_open_consecutive_count = 0
+
+    def _fail_open_rate_snapshot(self) -> tuple[int, float]:
+        now = time.time()
+        cutoff = now - _FAIL_OPEN_RATE_WINDOW_SECONDS
+        self._fail_open_timestamps = [
+            ts for ts in self._fail_open_timestamps if ts >= cutoff
+        ]
+        window_count = len(self._fail_open_timestamps)
+        rate_per_minute = window_count * (60.0 / _FAIL_OPEN_RATE_WINDOW_SECONDS)
+        return window_count, rate_per_minute
+
+    def _safe_fail_open_error_text(self, exc: BaseException) -> str:
+        redacted = redact_sensitive_value(str(exc), self._config)
+        text = str(redacted or "")
+        return text or type(exc).__name__
+
+    def _raw_messages_exceed_context_limit(
+        self,
+        raw_tokens: int,
+        context_limit: Optional[int],
+    ) -> bool:
+        return bool(context_limit and context_limit > 0 and raw_tokens >= context_limit)
+
+    def _record_fail_open_degraded(
+        self,
+        exc: BaseException,
+        *,
+        raw_tokens: int,
+        context_limit: Optional[int],
+        fallback_attempted: bool,
+        fallback_status: str,
+        fallback_exc: Optional[BaseException] = None,
+    ) -> None:
+        now = time.time()
+        safe_error = self._safe_fail_open_error_text(exc)
+        safe_fallback_error = (
+            self._safe_fail_open_error_text(fallback_exc)
+            if fallback_exc is not None
+            else ""
+        )
+
+        self._degraded = True
+        self._last_degraded_reason = "fail_open"
+        self._last_fail_open_at = now
+        self._last_fail_open_error = safe_error
+        self._last_fail_open_error_type = type(exc).__name__
+        self._last_fail_open_fallback_error = safe_fallback_error
+        self._last_fail_open_fallback_error_type = (
+            type(fallback_exc).__name__ if fallback_exc is not None else ""
+        )
+        self._last_fail_open_raw_tokens = raw_tokens
+        self._last_fail_open_context_limit = int(context_limit or 0)
+        self._last_fail_open_over_context_limit = self._raw_messages_exceed_context_limit(
+            raw_tokens,
+            context_limit,
+        )
+        self._last_fail_open_fallback_attempted = fallback_attempted
+        self._last_fail_open_fallback_status = fallback_status
+        self._fail_open_total_count += 1
+        self._fail_open_consecutive_count += 1
+        self._fail_open_timestamps.append(now)
+        window_count, rate_per_minute = self._fail_open_rate_snapshot()
+
+        if fallback_status == "succeeded":
+            self._last_compression_status = "degraded_fallback_compressed"
+            self._last_compression_noop_reason = ""
+        else:
+            self._last_compression_status = "degraded_fail_open"
+            self._last_compression_noop_reason = (
+                f"fail-open: {type(exc).__name__}: {safe_error}"
+            )
+
+        logger.warning(
+            "event=lcm_fail_open_degraded engine=lcm session_id=%s "
+            "error_type=%s error=%r raw_tokens=%d context_limit=%s "
+            "over_context_limit=%s fallback_attempted=%s fallback_status=%s "
+            "total=%d consecutive=%d window_seconds=%d window_count=%d "
+            "rate_per_minute=%.3f fallback_error_type=%s fallback_error=%r",
+            self.current_session_id or self._session_id or "",
+            type(exc).__name__,
+            safe_error,
+            raw_tokens,
+            int(context_limit or 0) if context_limit else "unknown",
+            self._last_fail_open_over_context_limit,
+            fallback_attempted,
+            fallback_status,
+            self._fail_open_total_count,
+            self._fail_open_consecutive_count,
+            int(_FAIL_OPEN_RATE_WINDOW_SECONDS),
+            window_count,
+            rate_per_minute,
+            type(fallback_exc).__name__ if fallback_exc is not None else "",
+            safe_fallback_error,
+        )
+
+    def _build_fail_open_fallback_compressor(self) -> Any:
+        from agent.context_compressor import ContextCompressor
+
+        return ContextCompressor(
+            model=self.model or "unknown",
+            threshold_percent=self.threshold_percent,
+            protect_first_n=self.protect_first_n,
+            protect_last_n=self.protect_last_n,
+            # D-10: honor the configured compression.target_ratio (was a
+            # hardcoded 0.20 that ignored the operator's setting).
+            summary_target_ratio=self._config.target_ratio,
+            quiet_mode=True,
+            summary_model_override=self.summary_model or self._config.summary_model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            config_context_length=self.context_length if self.context_length > 0 else None,
+            provider=self.provider,
+            api_mode=self.api_mode,
+            abort_on_summary_failure=False,
+        )
+
+    def _recoverable_fail_open_error(
+        self,
+        primary_exc: BaseException,
+        fallback_exc: BaseException,
+        *,
+        raw_tokens: int,
+        context_limit: Optional[int],
+    ) -> LCMFailOpenRecoveryError:
+        primary_text = self._safe_fail_open_error_text(primary_exc)
+        fallback_text = self._safe_fail_open_error_text(fallback_exc)
+        limit_text = str(int(context_limit or 0)) if context_limit else "unknown"
+        return LCMFailOpenRecoveryError(
+            "recoverable LCM fail-open overflow: primary LCM compression failed "
+            f"({type(primary_exc).__name__}: {primary_text}); raw context "
+            f"is over provider context limit ({raw_tokens}/{limit_text} tokens); "
+            "built-in ContextCompressor fallback failed "
+            f"({type(fallback_exc).__name__}: {fallback_text}). "
+            "No silent provider-overflow fallback is safe; start a fresh session "
+            "or manually compact after fixing LCM."
+        )
+
+    def _handle_fail_open_compression_exception(
+        self,
+        messages: List[Dict[str, Any]],
+        exc: Exception,
+        *,
+        current_tokens: Optional[int] = None,
+        focus_topic: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        raw_tokens = (
+            current_tokens
+            if current_tokens is not None and current_tokens > 0
+            else count_messages_tokens(messages)
+        )
+        request_overhead_tokens = max(0, raw_tokens - count_messages_tokens(messages))
+        context_limit = self.context_length if self.context_length > 0 else None
+
+        if not self._raw_messages_exceed_context_limit(raw_tokens, context_limit):
+            self._record_fail_open_degraded(
+                exc,
+                raw_tokens=raw_tokens,
+                context_limit=context_limit,
+                fallback_attempted=False,
+                fallback_status="not_needed_below_limit",
+            )
+            return messages
+
+        try:
+            fallback_compressor = self._build_fail_open_fallback_compressor()
+            fallback_messages = fallback_compressor.compress(
+                messages,
+                current_tokens=raw_tokens,
+                focus_topic=focus_topic,
+                force=True,
+            )
+            fallback_tokens = count_messages_tokens(fallback_messages) + request_overhead_tokens
+            if self._raw_messages_exceed_context_limit(fallback_tokens, context_limit):
+                raise LCMFailOpenRecoveryError(
+                    "built-in ContextCompressor fallback did not reduce raw "
+                    f"context below provider limit ({fallback_tokens}/"
+                    f"{int(context_limit or 0)} tokens)"
+                )
+        except Exception as fallback_exc:
+            self._record_fail_open_degraded(
+                exc,
+                raw_tokens=raw_tokens,
+                context_limit=context_limit,
+                fallback_attempted=True,
+                fallback_status="failed",
+                fallback_exc=fallback_exc,
+            )
+            raise self._recoverable_fail_open_error(
+                exc,
+                fallback_exc,
+                raw_tokens=raw_tokens,
+                context_limit=context_limit,
+            ) from fallback_exc
+
+        self._record_fail_open_degraded(
+            exc,
+            raw_tokens=raw_tokens,
+            context_limit=context_limit,
+            fallback_attempted=True,
+            fallback_status="succeeded",
+        )
+        self._ingest_cursor = len(fallback_messages)
+        self._ingest_cursor_needs_reconcile = False
+        return fallback_messages
 
     # -- ContextEngine optional methods ------------------------------------
 
@@ -1140,6 +1716,31 @@ class LCMEngine(ContextEngine):
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
+
+        # Garbage-collect empty lifecycle rows when the table exceeds threshold.
+        # Gateway restarts, ephemeral cron ticks, and crash-loops all create
+        # lifecycle rows that never ingest data — prune them here so they
+        # don't accumulate forever.
+        if (
+            self._config.empty_lifecycle_gc_enabled
+            and self._lifecycle.row_count() > self._config.empty_lifecycle_gc_threshold
+        ):
+            protected = {str(self._session_id)} if self._session_id else None
+            max_age = self._config.empty_lifecycle_gc_max_age_hours
+            try:
+                deleted = self._lifecycle.prune_empty_sessions(
+                    protected_session_ids=protected,
+                    max_age_hours=max_age,
+                )
+            except Exception:
+                deleted = 0
+            if deleted:
+                logger.info(
+                    "LCM pruned %d lifecycle rows with zero stored data "
+                    "(table exceeded threshold of %d rows)",
+                    deleted,
+                    self._config.empty_lifecycle_gc_threshold,
+                )
 
     def _persist_frontier_marker(self) -> None:
         if not self._session_id or not self._conversation_id:
@@ -1509,7 +2110,7 @@ class LCMEngine(ContextEngine):
 
     def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return []
@@ -1644,8 +2245,24 @@ class LCMEngine(ContextEngine):
         self._context_probe_persistable = False
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        self._last_condensations = []
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        self._degraded = False
+        self._last_degraded_reason = ""
+        self._last_fail_open_at = 0.0
+        self._last_fail_open_error = ""
+        self._last_fail_open_error_type = ""
+        self._last_fail_open_fallback_error = ""
+        self._last_fail_open_fallback_error_type = ""
+        self._last_fail_open_raw_tokens = 0
+        self._last_fail_open_context_limit = 0
+        self._last_fail_open_over_context_limit = False
+        self._last_fail_open_fallback_attempted = False
+        self._last_fail_open_fallback_status = ""
+        self._fail_open_total_count = 0
+        self._fail_open_consecutive_count = 0
+        self._fail_open_timestamps = []
         self._last_boundary_skip_time = 0
 
     def _reset_compaction_progress(self) -> None:
@@ -1664,6 +2281,11 @@ class LCMEngine(ContextEngine):
         """
         self._reset_session_counters()
         self._reset_compaction_progress()
+        # P2: skew calibration is per-conversation; clear it at a real session
+        # boundary so a ratio learned in one conversation can't scale down a fresh
+        # session's first preflight (Greptile #111). NOT called on the compression
+        # boundary path (same conversation continuing → skew is still valid there).
+        self.reset_skew_calibration()
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
@@ -1955,21 +2577,17 @@ class LCMEngine(ContextEngine):
                 source_session_id,
                 frontier_store_id=frontier,
             )
-            moved_messages = self._store.reassign_session_messages(source_session_id, session_id)
+            # Compression rollover carries derived context forward, but raw
+            # messages remain owned by the session that produced them. Moving
+            # raw rows here makes session-scoped transcript recovery report the
+            # old/child session as missing even though its payload was only
+            # reassigned to the next compression segment.
             moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
-            moved_payloads = reassign_externalized_payloads(
-                source_session_id,
-                session_id,
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
             logger.debug(
-                "LCM compression boundary continued %s -> %s: moved %d messages, %d DAG nodes, %d externalized payloads",
+                "LCM compression boundary continued %s -> %s: carried %d DAG nodes; preserved raw message ownership",
                 source_session_id,
                 session_id,
-                moved_messages,
                 moved_nodes,
-                moved_payloads,
             )
         elif old_session_id:
             logger.warning(
@@ -2230,13 +2848,16 @@ class LCMEngine(ContextEngine):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
-            LCM_GREP,
-            LCM_LOAD_SESSION,
-            LCM_DESCRIBE,
-            LCM_EXPAND,
-            LCM_EXPAND_QUERY,
-            LCM_STATUS,
-            LCM_DOCTOR,
+            {"type": "function", "function": schema}
+            for schema in (
+                LCM_GREP,
+                LCM_LOAD_SESSION,
+                LCM_DESCRIBE,
+                LCM_EXPAND,
+                LCM_EXPAND_QUERY,
+                LCM_STATUS,
+                LCM_DOCTOR,
+            )
         ]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -2325,6 +2946,7 @@ class LCMEngine(ContextEngine):
 
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
+        fail_open_window_count, fail_open_rate_per_minute = self._fail_open_rate_snapshot()
         status.update({
             "compression_count": self.compression_count,
             "last_prompt_tokens": self.last_prompt_tokens,
@@ -2341,6 +2963,28 @@ class LCMEngine(ContextEngine):
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "degraded": self._degraded,
+            "context_engine_degraded": self._degraded,
+            "degraded_reason": self._last_degraded_reason,
+            "last_fail_open_at": self._last_fail_open_at or None,
+            "last_fail_open_error": self._last_fail_open_error,
+            "last_fail_open_error_type": self._last_fail_open_error_type,
+            "last_fail_open_fallback_error": self._last_fail_open_fallback_error,
+            "last_fail_open_fallback_error_type": self._last_fail_open_fallback_error_type,
+            "last_fail_open_raw_tokens": self._last_fail_open_raw_tokens,
+            "last_fail_open_context_limit": self._last_fail_open_context_limit,
+            "last_fail_open_over_context_limit": self._last_fail_open_over_context_limit,
+            "last_fail_open_fallback_attempted": self._last_fail_open_fallback_attempted,
+            "last_fail_open_fallback_status": self._last_fail_open_fallback_status,
+            "fail_open_total_count": self._fail_open_total_count,
+            "fail_open_consecutive_count": self._fail_open_consecutive_count,
+            "fail_open_window_seconds": int(_FAIL_OPEN_RATE_WINDOW_SECONDS),
+            "fail_open_window_count": fail_open_window_count,
+            "fail_open_rate_per_minute": round(fail_open_rate_per_minute, 4),
+            "model": self.model,
+            "provider": self.provider,
+            "context_length_source": self._context_length_source,
+            "context_threshold": self._config.context_threshold,
         })
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
@@ -2383,9 +3027,18 @@ class LCMEngine(ContextEngine):
             status["last_rotate_at"] = None
             status["rotate_backup_size"] = 0
             status["rotate_backup_error"] = str(exc)
+        try:
+            status["storage_retention"] = retention_status(
+                self._store._conn,
+                self._store.db_path,
+                ttl_days=self._config.retention_ttl_days,
+                max_bytes=self._config.retention_max_bytes,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            status["storage_retention"] = {"error": str(exc)}
         if session_id:
             status["store_messages"] = self._store.get_session_count(session_id)
-            status["dag_nodes"] = len(self._dag.get_session_nodes(session_id))
+            status["dag_nodes"] = self._dag.get_session_node_count(session_id)
             status["session_platform"] = self.current_session_platform
             status["session_ignored"] = self.current_session_ignored
             status["session_stateless"] = self.current_session_stateless
@@ -3042,6 +3695,179 @@ class LCMEngine(ContextEngine):
             return False
         return stored_head[: len(incoming_identities)] == incoming_identities
 
+    def _compacted_replay_stored_tail_overlap(
+        self,
+        new_messages: List[Dict[str, Any]],
+        original_new_messages: List[Dict[str, Any]],
+        full_replay: List[Dict[str, Any]],
+    ) -> int:
+        """Count leading ``new_messages`` rows that already exist as the stored tail.
+
+        Dup-on-replay fix. After a compaction the replayed active context is
+        ``[scaffold/summary head] + [fresh tail of already-stored rows]``. The
+        cursor only skips the scaffold *system* head, so the (already-stored)
+        fresh tail — and any summary node row — get re-ingested as duplicates.
+        Return how many leading rows of ``new_messages`` form a contiguous run
+        that exactly matches the END of the durable store; those are already
+        persisted and must be skipped.
+
+        Hard safety gates (preserve the deliberate dup-over-loss guarantee):
+        - Returns 0 unless the FULL replay carries scaffold evidence in its head
+          (``_is_replayed_context_scaffold_message``). A genuinely-new
+          tail-only delta has no scaffold head and is NEVER de-duplicated, so a
+          real new message that coincidentally repeats the durable tail is
+          still ingested (dup-over-loss).
+        - Only a contiguous run anchored at the exact stored tail counts; a
+          partial/interior match returns 0.
+        """
+        if not new_messages or not self._session_id:
+            return 0
+
+        # Identities of the candidate rows. Skip scaffold rows AND summary-node
+        # rows (the compaction summary assistant message), which are active
+        # context only and never stored as durable transcript rows.
+        candidate = [
+            (idx, self._message_replay_identity(msg))
+            for idx, msg in enumerate(new_messages)
+            if not self._is_replayed_context_scaffold_message(msg)
+            and not self._is_summary_node_replay_message(msg)
+            and not self._matches_ignore_message_patterns(msg)
+        ]
+        if not candidate:
+            return 0
+
+        # 🔴 SCAFFOLD MUST BE IN THE HEAD THAT PRECEDES THE STORED-TAIL RUN
+        # (Greptile #107 P1, 2nd): the overlap skip is only safe for a genuine
+        # post-compaction replay, whose shape is [scaffold/summary head] +
+        # [already-stored fresh tail]. So the scaffold evidence must sit in the
+        # head BEFORE the first candidate row — every new_messages row up to the
+        # first candidate must be scaffold/summary-only, and the head (incl. the
+        # part of full_replay that precedes new_messages) must contain real
+        # scaffold evidence. `_is_replayed_context_scaffold_message` also matches
+        # a preserved-objective message regardless of role/position; if such a
+        # message appears INTERLEAVED with genuinely-new turns (not as a clean
+        # compaction head), this gate must NOT fire, or we'd drop real new rows
+        # that coincidentally match the stored tail.
+        first_candidate_idx = candidate[0][0]
+        head_before_run = new_messages[:first_candidate_idx]
+        # Every row before the first candidate must be scaffold/summary scaffolding
+        # (i.e. the candidate run starts immediately after a pure scaffold head).
+        if any(
+            not self._is_replayed_context_scaffold_message(msg)
+            and not self._is_summary_node_replay_message(msg)
+            for msg in head_before_run
+        ):
+            return 0
+        # And real scaffold evidence must exist in that head — either in the
+        # rows preceding new_messages within the full replay (the scaffold system
+        # row is typically cut by the cursor) or in head_before_run itself.
+        # 🔴 Require the STRONG compaction signal (the LCM system note or an
+        # actual summary-node row), NOT the weak preserved-objective prefix
+        # alone: a genuinely-new user turn can legitimately start with
+        # "[Current user objective preserved from compacted history]" and
+        # `_is_replayed_context_scaffold_message` matches it regardless of
+        # role/position, so trusting it as proof-of-replay drops real new rows
+        # (Greptile #107 P1, 2nd). The strong signal only appears in a true
+        # post-compaction active context.
+        replay_head = list(full_replay or [])
+        if new_messages:
+            cut = len(replay_head) - len(new_messages)
+            preceding = replay_head[:cut] if cut > 0 else []
+        else:
+            preceding = replay_head
+        has_scaffold = any(
+            self._is_strong_compaction_scaffold(msg)
+            for msg in (list(preceding) + list(head_before_run))
+        )
+        if not has_scaffold:
+            return 0
+
+        try:
+            session_count = self._store.get_session_count(self._session_id)
+        except Exception:  # pragma: no cover - defensive
+            return 0
+        if session_count <= 0:
+            return 0
+
+        # Pull a stored tail at least as long as the candidate run.
+        tail_limit = min(max(len(candidate) * 2, 64), session_count)
+        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        stored_tail = [
+            self._message_replay_identity(row, stored_row=True)
+            for row in stored_rows
+            if not self._matches_ignore_message_patterns(row, stored_row=True)
+        ]
+        if not stored_tail:
+            return 0
+
+        # Match the leading candidate run against a suffix of the stored tail
+        # that ends at the true end of the store.
+        #
+        # 🔴 DUP-OVER-LOSS (Greptile #107 P1): pick the SMALLEST matching run,
+        # never the largest. When the stored tail contains a REPEATING identity
+        # pattern (e.g. store ends [A,B,A,B,A,B] and the replay is the kept fresh
+        # tail [A,B,A,B] followed by GENUINELY-NEW turns [A,B]), the longest
+        # match overshoots the real fresh-tail boundary and skips the new turns
+        # as "overlap" — silent data loss. Content alone cannot distinguish a
+        # replayed stored row from a new row with identical content, so we bias
+        # toward NEW: the real kept-fresh-tail length T is always in the matching
+        # set, so the smallest matching run is provably <= T and therefore never
+        # skips a genuinely-new row. Worst case under repetition we skip too few
+        # (a few residual dups the dedup pass cleans), never too many.
+        best = 0
+        max_run = min(len(candidate), len(stored_tail))
+        for run in range(1, max_run + 1):
+            cand_ids = [ident for _idx, ident in candidate[:run]]
+            if cand_ids == stored_tail[-run:]:
+                best = run
+                break
+        if best == 0:
+            return 0
+
+        # Translate the candidate-run length back to an absolute count of leading
+        # new_messages rows (including any interleaved scaffold/summary rows up
+        # to the last matched candidate row).
+        last_matched_new_idx = candidate[best - 1][0]
+        return last_matched_new_idx + 1
+
+    def _is_strong_compaction_scaffold(self, msg: Dict[str, Any]) -> bool:
+        """Return true ONLY for the strong post-compaction active-context markers.
+
+        Unlike ``_is_replayed_context_scaffold_message`` (which also matches the
+        weak ``[Current user objective preserved from compacted history]``
+        prefix that a genuinely-new user turn could legitimately start with),
+        this recognizes only signals that appear EXCLUSIVELY in a real
+        post-compaction active context: the LCM system note, or a synthesized
+        summary-node row. Used to gate the stored-tail overlap skip so a
+        non-compaction replay carrying a preserved-objective message can never
+        trigger a (data-losing) overlap skip. (Greptile #107 P1, 2nd.)
+        """
+        role = str(msg.get("role") or "")
+        content = normalize_content_value(msg.get("content")) or ""
+        if role == "system" and (
+            "[Note: This conversation uses Lossless Context Management (LCM)." in content
+            and "Earlier turns have been compacted into hierarchical summaries below." in content
+        ):
+            return True
+        return self._is_summary_node_replay_message(msg)
+
+    @staticmethod
+    def _is_summary_node_replay_message(msg: Dict[str, Any]) -> bool:
+        """Return true for a compaction summary-node row in the active replay.
+
+        These are synthesized at compaction (``[Recent Summary (dN, node …)]`` /
+        ``[Session Arc …]`` / ``[Durable …]`` with ``[Expand for details: …]``)
+        and live in active context only — never persisted as durable transcript
+        rows, so they must not anchor or block the stored-tail overlap scan.
+        """
+        content = normalize_content_value(msg.get("content")) or ""
+        stripped = content.lstrip()
+        return (
+            stripped.startswith("[Recent Summary")
+            or stripped.startswith("[Session Arc")
+            or stripped.startswith("[Durable")
+        ) and "[Expand for details:" in content
+
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         if not self._session_id or not messages:
@@ -3207,6 +4033,11 @@ class LCMEngine(ContextEngine):
             prefer_existing_externalized=prefer_existing_externalized,
         )
         replay_messages = self._redact_active_replay_messages(replay_messages)
+        # When the cursor reconcile advances PAST durable (non-scaffold) rows the
+        # already-stored fresh tail is accounted for by the cursor itself, so the
+        # stored-tail overlap guard (the fallback for a *scaffold-only* advance)
+        # must be suppressed to avoid double-counting (Greptile #107 P1, 3rd).
+        reconcile_consumed_durable_tail = False
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = replay_messages
             if self._compiled_ignore_message_patterns:
@@ -3216,6 +4047,17 @@ class LCMEngine(ContextEngine):
                 ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
+            # Did the reconcile advance the cursor PAST durable (non-scaffold)
+            # rows? If so the already-stored fresh tail is ALREADY accounted for
+            # by the cursor, and the stored-tail overlap guard below — which is
+            # only the fallback for a *scaffold-only* cursor advance — must NOT
+            # run, or it double-counts and strips a genuinely-new row that
+            # coincidentally repeats the last stored identity (Greptile #107 P1,
+            # 3rd). When the reconcile only skipped the scaffold head
+            # (no durable rows consumed), the guard is still needed.
+            reconcile_consumed_durable_tail = bool(self._ingest_cursor) and bool(
+                self._effective_replay_identities(reconcile_messages[: self._ingest_cursor])
+            )
         cursor = min(max(self._ingest_cursor, 0), n)
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
@@ -3226,6 +4068,45 @@ class LCMEngine(ContextEngine):
         original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
+            return replay_messages
+
+        # --- Compacted-replay suffix-overlap guard (dup-on-replay fix) ---------
+        # After a compaction the active context replayed on a restart/re-bind is
+        # [scaffold/summary head] + [fresh tail of already-stored rows]. The
+        # scaffold head breaks prefix-based replay proof, so the cursor only
+        # skips the head and the (already-stored) fresh tail gets re-ingested as
+        # duplicates. When — and ONLY when — the head carries scaffold evidence
+        # (proving this is a post-compaction replay, never a genuinely-new
+        # tail-only delta), drop the leading run of new_messages that already
+        # exists as the stored tail. Gating on scaffold evidence preserves the
+        # deliberate dup-over-loss guarantee for anchorless deltas.
+        overlap = (
+            0
+            if reconcile_consumed_durable_tail
+            else self._compacted_replay_stored_tail_overlap(
+                new_messages, original_new_messages, replay_messages
+            )
+        )
+        if overlap > 0:
+            self._record_ingest_reconciliation(
+                action="skipped overlap",
+                reason="skipped already-stored compacted tail",
+                cursor=cursor + overlap,
+                incoming=n,
+                session_count=self._store.get_session_count(self._session_id),
+                stored_tail_count=overlap,
+            )
+            logger.debug(
+                "LCM skipped %d already-stored rows after compacted replay: session=%s",
+                overlap,
+                self._session_id,
+            )
+            new_messages = new_messages[overlap:]
+            original_new_messages = original_new_messages[overlap:]
+            cursor += overlap
+
+        if not new_messages:
+            self._ingest_cursor = n
             return replay_messages
 
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
@@ -3304,10 +4185,23 @@ class LCMEngine(ContextEngine):
         content from older already-compacted history cannot hijack the mapping.
         Synthetic summary messages simply fail to match and are skipped.
         """
-        candidates = [
-            stored for stored in self._store.get_session_messages(self._session_id)
-            if stored["store_id"] > self._last_compacted_store_id
-        ]
+        candidates: list[Dict[str, Any]] = []
+        next_candidate_after = self._last_compacted_store_id
+        candidates_exhausted = False
+
+        def ensure_candidate_loaded(index: int) -> bool:
+            nonlocal next_candidate_after, candidates_exhausted
+            while index >= len(candidates) and not candidates_exhausted:
+                page = self._store.get_session_messages_after(
+                    self._session_id,
+                    after_store_id=next_candidate_after,
+                )
+                if not page:
+                    candidates_exhausted = True
+                    break
+                candidates.extend(page)
+                next_candidate_after = page[-1]["store_id"]
+            return index < len(candidates)
 
         ids: list[int] = []
         store_idx = 0
@@ -3315,7 +4209,7 @@ class LCMEngine(ContextEngine):
             message_identity = self._message_replay_identity(msg)
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = store_idx
-            while probe_idx < len(candidates):
+            while ensure_candidate_loaded(probe_idx):
                 stored = candidates[probe_idx]
                 stored_identity = self._message_replay_identity(stored, stored_row=True)
                 if stored_identity == message_identity:
@@ -3341,7 +4235,15 @@ class LCMEngine(ContextEngine):
             serialized = self._serialize_messages(messages)
             output_path = self._config.extraction_output_path
             if not output_path:
-                base = self._hermes_home or os.path.expanduser("~/.hermes")
+                # ``hermes_home`` defaults to "" on the constructor, so this
+                # fallback is reachable and WRITES — a bare expanduser here
+                # escapes to the real home under hermetic / alternate-profile
+                # runs (t_43d5c42d). Same resolution order as _resolve_db_path.
+                base = self._hermes_home or os.environ.get("HERMES_HOME")
+                if not base:
+                    from hermes_constants import get_hermes_home
+
+                    base = str(get_hermes_home())
                 output_path = os.path.join(base, "lcm-extractions")
             extraction_model = self._config.extraction_model or self._config.summary_model
             extract_before_compaction(
@@ -3422,8 +4324,6 @@ class LCMEngine(ContextEngine):
                 self._config,
                 parse_json_strings=False,
             )
-            content = sanitize_pre_compaction_content(content)
-
             if role == "tool":
                 tool_id = str(msg.get("tool_call_id") or "").strip()
                 externalized = maybe_externalize_tool_output(
@@ -3435,10 +4335,14 @@ class LCMEngine(ContextEngine):
                 )
                 if externalized:
                     content = externalized["placeholder"]
-                elif len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                else:
+                    content = sanitize_pre_compaction_content(content)
+                    if len(content) > 3000:
+                        content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
+
+            content = sanitize_pre_compaction_content(content)
 
             if role == "assistant":
                 tool_calls = msg.get("tool_calls", [])
@@ -3629,6 +4533,7 @@ class LCMEngine(ContextEngine):
         dropped_assistant_messages = 0
         stripped_assistant_messages = 0
         for msg in messages:
+            msg = self._sanitize_active_preserved_objective_message(msg)
             if msg.get("role") == "assistant":
                 cleaned_msg = self._clean_active_assistant_message(msg)
                 if cleaned_msg is None:
@@ -3651,10 +4556,14 @@ class LCMEngine(ContextEngine):
                 stripped_assistant_messages,
             )
 
-        return self._sanitize_tool_pairs(
+        paired = self._sanitize_tool_pairs(
             cleaned,
             insert_missing_tool_stubs=insert_missing_tool_stubs,
         )
+        # Merge any assistant rows left adjacent once tool rows were dropped —
+        # emit an alternation-clean active context so downstream loads don't
+        # have to repair it and the persisted message_count matches replay.
+        return _merge_adjacent_assistant_messages(paired)
 
     def _sanitize_tool_pairs(
         self,
@@ -3769,6 +4678,10 @@ class LCMEngine(ContextEngine):
     ) -> None:
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
+        # Per-event condensation ledger for the compaction summary line: each entry
+        # is (from_depth, to_depth) for a condensation that fired THIS call. Reset
+        # here so the compaction log reports only this event's cascade.
+        self._last_condensations = []
 
         max_depth = self._config.incremental_max_depth
         if max_depth == 0:
@@ -3840,6 +4753,7 @@ class LCMEngine(ContextEngine):
             )
             self._dag.add_node(node)
             condensed_any = True
+            self._last_condensations.append((depth, depth + 1))
 
             logger.info(
                 "LCM condensation: d%d × %d → d%d (L%d, %d→%d tokens)",
@@ -3883,15 +4797,40 @@ class LCMEngine(ContextEngine):
         content = text_content_for_pattern_matching(message.get("content")) or ""
         return content if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) else ""
 
-    def _build_preserved_objective_summary_part(self, message: Dict[str, Any]) -> str:
-        content = text_content_for_pattern_matching(message.get("content")) or ""
+    def _sanitized_preserved_objective_context_content(self, message: Dict[str, Any]) -> str:
+        preserved_objective = self._preserved_objective_context_content(message)
+        if not preserved_objective:
+            return ""
+        return self._sanitize_preserved_objective_content(
+            preserved_objective,
+            role=str(message.get("role") or "user"),
+        )
+
+    def _sanitize_active_preserved_objective_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized_content = self._sanitized_preserved_objective_context_content(message)
+        if not sanitized_content or sanitized_content == message.get("content"):
+            return message
+        sanitized = dict(message)
+        sanitized["content"] = sanitized_content
+        return sanitized
+
+    def _sanitize_preserved_objective_content(self, content: str, role: str = "user") -> str:
+        content = strip_injected_context_blocks(content)
         content = protect_inline_payloads_in_text(
             content,
-            role=str(message.get("role") or "user"),
+            role=role,
             session_id=self._session_id,
             field_path="preserved_objective.content",
             config=self._config,
             hermes_home=self._hermes_home,
+        )
+        return content
+
+    def _build_preserved_objective_summary_part(self, message: Dict[str, Any]) -> str:
+        content = text_content_for_pattern_matching(message.get("content")) or ""
+        content = self._sanitize_preserved_objective_content(
+            content,
+            role=str(message.get("role") or "user"),
         )
         return f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n{content}"
 
@@ -3917,14 +4856,14 @@ class LCMEngine(ContextEngine):
         for message in reversed(messages):
             if not isinstance(message, dict):
                 continue
-            preserved_objective = self._preserved_objective_context_content(message)
-            if preserved_objective:
+            sanitized_preserved_objective = self._sanitized_preserved_objective_context_content(message)
+            if sanitized_preserved_objective:
                 if any(
-                    self._preserved_objective_context_content(selected) == preserved_objective
+                    self._sanitized_preserved_objective_context_content(selected) == sanitized_preserved_objective
                     for selected in selected_tail_messages
                 ):
                     return None
-                return preserved_objective
+                return sanitized_preserved_objective
             if message.get("role") != "user":
                 continue
             if self._is_preserved_todo_context_message(message):
@@ -4005,7 +4944,16 @@ class LCMEngine(ContextEngine):
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
         last_role = result[-1].get("role", "system") if result else "system"
-        summary_role = "assistant" if last_role != "assistant" else "user"
+        if not result or result[-1].get("role") == "system":
+            # The summary becomes the first provider-visible message: either no
+            # leading anchor exists (gateway-style assembly) or the system
+            # prompt is the only anchor, which Anthropic extracts into a
+            # separate field. Either way messages[0] must be role "user"; an
+            # assistant summary here is rejected with HTTP 400 after the second
+            # compaction.
+            summary_role = "user"
+        else:
+            summary_role = "assistant" if last_role != "assistant" else "user"
         if anchor_part is not None:
             anchor_msg = {"role": summary_role, "content": anchor_part}
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
@@ -4045,7 +4993,12 @@ class LCMEngine(ContextEngine):
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
-                result.append({"role": summary_role, "content": combined})
+                # Structural marker so downstream compaction-stats classification
+                # detects this summary row exactly, without depending on the marker
+                # text surviving content flattening. ``_``-prefixed → stripped by the
+                # transport sanitizer / not copied by the allowlist-rebuild adapters,
+                # so it never reaches a provider request or perturbs the prompt cache.
+                result.append({"role": summary_role, "content": combined, "_lcm_summary": True})
 
         # Fresh tail
         result.extend(tail_selected)
@@ -4357,7 +5310,15 @@ class LCMEngine(ContextEngine):
         if self._session_stateless:
             return {"ok": False, "reason": "session_stateless", "session_id": session_id}
 
-        fresh_tail_count = max(1, int(self._config.fresh_tail_count))
+        # D-7: never advance the frontier past rows that may still be inside
+        # the (possibly wider, token-budgeted) in-memory fresh tail — use the
+        # max of the static config count and the dynamic count last used by
+        # compress().
+        fresh_tail_count = max(
+            1,
+            int(self._config.fresh_tail_count),
+            int(getattr(self, "_last_fresh_tail_count", 0) or 0),
+        )
         total_count = int(self._store.get_session_count(session_id))
 
         state = self._lifecycle.get_by_conversation(conversation_id)

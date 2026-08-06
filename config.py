@@ -135,6 +135,89 @@ def _hermes_compression_threshold(default: float) -> float:
         return default
 
 
+def _hermes_compression_float(key: str, default: float) -> float:
+    """Read ``compression.<key>`` (a float) from ~/.hermes/config.yaml.
+
+    Used for the P2 calibration knobs (``skew_floor``, ``calibration_hard_frac``)
+    so the LCM engine — a process-global singleton — sources them ONCE from config
+    at construction, rather than having each agent_init mutate the shared instance
+    (which would let one agent's config silently change another's calibration —
+    Greptile PR #111). Returns ``default`` on any read/parse failure or absence.
+    """
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    cfg_path = home / "config.yaml"
+    try:
+        if yaml is None:
+            return default
+        cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        compression = cfg.get("compression") or {}
+        val = compression.get(key)
+        if val is None:
+            return default
+        val = float(val)
+        return val if 0.0 < val <= 1.0 else default
+    except Exception:
+        return default
+
+
+def _hermes_lcm_value(key: str):
+    """Read ``lcm.<key>`` from ~/.hermes/config.yaml; None on absence/failure."""
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    cfg_path = home / "config.yaml"
+    try:
+        if yaml is None:
+            return None
+        cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        return (cfg.get("lcm") or {}).get(key)
+    except Exception:
+        return None
+
+
+def _hermes_lcm_int(key: str, default: int) -> int:
+    """Read ``lcm.<key>`` as a non-negative int; ``default`` on any failure."""
+    val = _hermes_lcm_value(key)
+    if val is None:
+        return default
+    try:
+        parsed = int(val)
+        return parsed if parsed >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _lcm_config_bool(env_key: str, cfg_key: str, default: bool) -> bool:
+    """Resolve a boolean knob: env override → lcm.<cfg_key> config → default.
+
+    Fail-safe: only explicit falsy values ("0", "false", "no", "off") disable;
+    unrecognized/garbage values keep the default (same doctrine as
+    LCM_IDENTIFIER_FIDELITY — never silently drop a production behavior on a
+    typo).
+    """
+    falsy = {"0", "false", "no", "off"}
+    truthy = {"1", "true", "yes", "on"}
+
+    raw_env = os.environ.get(env_key)
+    if raw_env is not None:
+        lowered = raw_env.strip().lower()
+        if lowered in falsy:
+            return False
+        if lowered in truthy:
+            return True
+        return default
+
+    val = _hermes_lcm_value(cfg_key)
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    lowered = str(val).strip().lower()
+    if lowered in falsy:
+        return False
+    if lowered in truthy:
+        return True
+    return default
+
+
 def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
     """Read Hermes auxiliary.compression.timeout when no LCM override is present.
 
@@ -204,6 +287,23 @@ class LCMConfig:
 
     # -- Fresh tail: recent messages never compacted ---
     fresh_tail_count: int = 32
+    # Token-budgeted fresh tail (compression.target_ratio support).
+    # When enabled and a context window is known, the fresh tail is sized
+    # dynamically: keep the most recent messages whose estimated tokens fit
+    # ``target_ratio × threshold_tokens`` (floored at ``fresh_tail_count``
+    # messages, capped at ``fresh_tail_max_tokens``). Disabled or degenerate
+    # inputs reproduce the legacy fixed-count tail exactly.
+    fresh_tail_token_budget_enabled: bool = True
+    # 0 = derive from target_ratio × threshold_tokens; >0 = explicit budget.
+    fresh_tail_token_budget: int = 0
+    # Hard cap on the derived/explicit budget (guards 1M-window models).
+    fresh_tail_max_tokens: int = 60_000
+    # Fleet-standard kept-tail ratio, sourced from compression.target_ratio
+    # (config.yaml) exactly like skew_floor — the LCM engine is a process-global
+    # singleton, so this is read ONCE at construction (Greptile #111 discipline).
+    # NOTE: the fleet key is compression.target_ratio; an ``lcm.target_ratio``
+    # key is intentionally NOT read.
+    target_ratio: float = 0.20
 
     # -- Compaction thresholds ---
     # Max source tokens in a leaf chunk before summarization triggers
@@ -233,6 +333,14 @@ class LCMConfig:
     # Disabled at 0.0. When set, only bypass cache-friendly/deferred polite
     # gates once prompt pressure reaches this fraction of the context window.
     critical_budget_pressure_ratio: float = 0.0
+
+    # -- P2 "compact on the truth" calibration (shared via ContextEngine ABC) ---
+    # Lower clamp on the measured real/rough skew (never scale an estimate below
+    # this fraction). Sourced from compression.skew_floor.
+    skew_floor: float = 0.7
+    # Raw-rough window fraction at which compaction fires regardless of skew
+    # (dense-paste / 413 ceiling). Sourced from compression.calibration_hard_frac.
+    calibration_hard_frac: float = 0.95
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1
@@ -312,12 +420,34 @@ class LCMConfig:
 
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
+    # Optional per-row AEAD for raw message columns. When enabled, cryptography
+    # must be installed and the profile-local key file is created with 0600.
+    encryption_enabled: bool = False
+    encryption_key_path: str = ""  # empty = HERMES_HOME/lcm-row.key
+    # Retention policy reported by status/doctor. Cleanup remains explicit.
+    retention_ttl_days: int = 14
+    retention_max_bytes: int = 1024 * 1024 * 1024
 
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)
     new_session_retain_depth: int = 2
     # Safety gate: destructive `/lcm doctor clean apply` workflow is disabled by default.
     doctor_clean_apply_enabled: bool = False
+
+    # -- Lifecycle GC ---
+    # Enables automatic pruning of lifecycle rows for sessions that never
+    # ingested any messages or nodes (gateway restart orphans, ephemeral
+    # cron ticks, etc.).  Runs at session-start when the lifecycle table
+    # exceeds ``empty_lifecycle_gc_threshold`` rows.
+    empty_lifecycle_gc_enabled: bool = True
+    # Number of lifecycle rows at which the GC pass fires.  Default 200
+    # so fresh installs skip the work until enough churn has occurred.
+    empty_lifecycle_gc_threshold: int = 200
+    # Age guard for automatic lifecycle GC. Startup GC must not delete
+    # recently-bound empty rows because another live engine may not have
+    # ingested its first message yet. Set to 0 only in trusted/test
+    # environments that intentionally want immediate empty-row pruning.
+    empty_lifecycle_gc_max_age_hours: float | None = 24.0
 
     @classmethod
     def from_env(cls) -> "LCMConfig":
@@ -328,6 +458,27 @@ class LCMConfig:
         _str = lambda key, default: os.environ.get(key, default)
 
         c.fresh_tail_count = _int("LCM_FRESH_TAIL_COUNT", c.fresh_tail_count)
+        c.fresh_tail_token_budget_enabled = _lcm_config_bool(
+            "LCM_FRESH_TAIL_TOKEN_BUDGET_ENABLED",
+            "fresh_tail_token_budget_enabled",
+            c.fresh_tail_token_budget_enabled,
+        )
+        c.fresh_tail_token_budget = _int(
+            "LCM_FRESH_TAIL_TOKEN_BUDGET",
+            _hermes_lcm_int("fresh_tail_token_budget", c.fresh_tail_token_budget),
+        )
+        c.fresh_tail_max_tokens = _int(
+            "LCM_FRESH_TAIL_MAX_TOKENS",
+            _hermes_lcm_int("fresh_tail_max_tokens", c.fresh_tail_max_tokens),
+        )
+        c.target_ratio = _float(
+            "LCM_TARGET_RATIO",
+            _hermes_compression_float("target_ratio", c.target_ratio),
+        )
+        # Same (0, 1] range guard as the config-file path — an out-of-range
+        # env override must not defeat the clamp (Greptile PR review).
+        if not (0.0 < c.target_ratio <= 1.0):
+            c.target_ratio = 0.20
         c.leaf_chunk_tokens = _int("LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens)
         c.context_threshold = _float(
             "LCM_CONTEXT_THRESHOLD",
@@ -358,6 +509,15 @@ class LCMConfig:
         c.critical_budget_pressure_ratio = _float(
             "LCM_CRITICAL_BUDGET_PRESSURE_RATIO",
             c.critical_budget_pressure_ratio,
+        )
+        # P2 calibration knobs: env override → compression.<key> config → default.
+        c.skew_floor = _float(
+            "LCM_SKEW_FLOOR",
+            _hermes_compression_float("skew_floor", c.skew_floor),
+        )
+        c.calibration_hard_frac = _float(
+            "LCM_CALIBRATION_HARD_FRAC",
+            _hermes_compression_float("calibration_hard_frac", c.calibration_hard_frac),
         )
         c.l2_budget_ratio = _float("LCM_L2_BUDGET_RATIO", c.l2_budget_ratio)
         c.l3_truncate_tokens = _int("LCM_L3_TRUNCATE_TOKENS", c.l3_truncate_tokens)
@@ -411,11 +571,33 @@ class LCMConfig:
         )
         c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
+        c.encryption_enabled = _parse_bool_env(
+            "LCM_ENCRYPTION_ENABLED",
+            c.encryption_enabled,
+        )
+        c.encryption_key_path = _str("LCM_ENCRYPTION_KEY_PATH", c.encryption_key_path) or ""
+        c.retention_ttl_days = _int("LCM_RETENTION_TTL_DAYS", c.retention_ttl_days)
+        c.retention_max_bytes = _int("LCM_RETENTION_MAX_BYTES", c.retention_max_bytes)
         c.new_session_retain_depth = _int("LCM_NEW_SESSION_RETAIN_DEPTH", c.new_session_retain_depth)
         c.doctor_clean_apply_enabled = _parse_bool_env(
             "LCM_DOCTOR_CLEAN_APPLY_ENABLED",
             c.doctor_clean_apply_enabled,
         )
+
+        c.empty_lifecycle_gc_enabled = _parse_bool_env(
+            "LCM_EMPTY_LIFECYCLE_GC_ENABLED",
+            c.empty_lifecycle_gc_enabled,
+        )
+        c.empty_lifecycle_gc_threshold = _int(
+            "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD",
+            c.empty_lifecycle_gc_threshold,
+        )
+        raw_max_age = os.environ.get("LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS")
+        if raw_max_age is not None:
+            try:
+                c.empty_lifecycle_gc_max_age_hours = float(raw_max_age)
+            except (TypeError, ValueError):
+                pass
 
         raw_ignore = os.environ.get("LCM_IGNORE_SESSION_PATTERNS")
         if raw_ignore is not None:

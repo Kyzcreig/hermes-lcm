@@ -17,7 +17,7 @@ from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -517,8 +517,52 @@ def _fts_missing_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec
     return bool(expected - existing)
 
 
+def _normalize_trigger_sql(sql: str) -> str:
+    """Canonicalize a CREATE TRIGGER statement for content comparison.
+
+    SQLite stores triggers with ``IF NOT EXISTS`` stripped and the trailing
+    ``;`` removed, so a byte compare against the spec's source SQL always
+    mismatches. Normalize both sides (drop ``IF NOT EXISTS``, collapse
+    whitespace, strip the terminator, lowercase) so the only differences that
+    survive are real ones — e.g. a trigger body that still references a renamed
+    column.
+    """
+    text = sql or ""
+    text = re.sub(r"(?i)\bIF\s+NOT\s+EXISTS\s+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.rstrip(";").strip().lower()
+
+
+def _fts_stale_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    """True if a trigger exists by name but its body has drifted from the spec.
+
+    ``_fts_missing_triggers`` only checks existence by name, so a trigger left
+    over from an older schema (e.g. one that still inserts a since-renamed
+    column) passes that check while aborting every write at runtime. Compare the
+    stored trigger body against the canonical spec SQL to catch that drift.
+    """
+    for trigger_sql in spec.trigger_sqls:
+        name = _extract_trigger_name(trigger_sql)
+        if not name:
+            continue
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            # Missing entirely — handled by _fts_missing_triggers; not "stale".
+            continue
+        if _normalize_trigger_sql(str(row[0])) != _normalize_trigger_sql(trigger_sql):
+            return True
+    return False
+
+
 def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
-    return _fts_needs_rebuild_structural(conn, spec) or _fts_missing_triggers(conn, spec)
+    return (
+        _fts_needs_rebuild_structural(conn, spec)
+        or _fts_missing_triggers(conn, spec)
+        or _fts_stale_triggers(conn, spec)
+    )
 
 
 def repair_external_content_fts(
@@ -559,6 +603,13 @@ def repair_external_content_fts(
         rebuilt = True
 
     triggers_were_missing = _fts_missing_triggers(conn, spec)
+    triggers_were_stale = _fts_stale_triggers(conn, spec)
+    if triggers_were_missing or triggers_were_stale:
+        # A stale trigger exists by name but with a drifted body (e.g. it still
+        # inserts a since-renamed column), so a bare ``CREATE TRIGGER IF NOT
+        # EXISTS`` would no-op and leave the broken trigger in place. Drop first,
+        # then recreate from the canonical spec so the body is guaranteed fresh.
+        _drop_fts_triggers(conn, spec.trigger_sqls)
     for trigger_sql in spec.trigger_sqls:
         conn.execute(trigger_sql)
     if rebuilt:
@@ -566,7 +617,11 @@ def repair_external_content_fts(
         # next startup can skip the deep integrity-check within the interval.
         _record_integrity_checked(conn, spec, now=now)
     conn.commit()
-    return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
+    return {
+        "rebuilt": rebuilt,
+        "degraded": degraded,
+        "triggers_recreated": triggers_were_missing or triggers_were_stale,
+    }
 
 
 def ensure_external_content_fts(
@@ -575,6 +630,33 @@ def ensure_external_content_fts(
     # Startup path: throttle the deep integrity-check. Explicit repair callers
     # use ``repair_external_content_fts(..., throttle=False)`` for a forced check.
     repair_external_content_fts(conn, spec, now=now, throttle=True)
+
+
+def ensure_messages_dedup_columns(conn: sqlite3.Connection) -> None:
+    """Add the replay-dedup + timestamp-fidelity columns to ``messages``.
+
+    Idempotent (additive, ignored by older readers). These back the historical
+    replay-block dedup soft-hide (``superseded_by``) and the timestamp backfill
+    provenance flags. The search/grep read path filters ``superseded_by IS NULL``
+    so a soft-hidden replay copy never resurfaces as a duplicate hit.
+    """
+    # The messages table is created by the store before migrations run in the
+    # normal path, but some callers run migrations on a bare connection — skip
+    # cleanly if it's not there yet (the columns are added when it next exists).
+    has_messages = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()
+    if not has_messages:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "superseded_by" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN superseded_by TEXT")
+    if "timestamp_original" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN timestamp_original REAL")
+    if "timestamp_reconstructed" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN timestamp_reconstructed INTEGER DEFAULT 0")
+    if "timestamp_verified" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN timestamp_verified INTEGER DEFAULT 0")
 
 
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:
@@ -597,5 +679,10 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 4:
         mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
         current_version = 4
+
+    ensure_messages_dedup_columns(conn)
+    if current_version < 5:
+        mark_migration_step_complete(conn, "v5_messages_dedup_timestamp_columns")
+        current_version = 5
 
     set_schema_version(conn, current_version)

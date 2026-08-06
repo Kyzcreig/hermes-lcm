@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,24 @@ _THINK_BLOCK_RE = re.compile(
     r".*?"
     r"</(?P=tag)\s*>",
     re.IGNORECASE | re.DOTALL,
+)
+
+# Matches the *start* of a reasoning block with no required close. Applied to
+# text after closed <think>...</think> pairs have been stripped: if what
+# remains still begins with a reasoning marker, the model emitted an *unclosed*
+# block (typically because it ran into max_tokens before the closing tag), and
+# the leftover raw reasoning must not be persisted as the summary. Covers the
+# angle-tag family plus pipe-delimited (<|think|>), bracket ([think]), and
+# prose-header (``Thinking Process:`` / ``Chain of thought:``) shapes.
+_REASONING_START_RE = re.compile(
+    r"^\s*(?:"
+    r"<\s*(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)(?:\s[^>]*)?>"
+    r"|<\|\s*(?:start_of_)?(?:think|thinking|reasoning|thought)\s*\|>"
+    r"|\[\s*(?:think|thinking|reasoning|thought)\s*\]"
+    r"|(?:#{1,6}\s*)?(?:thinking|reasoning|thought)\s+process\s*:"
+    r"|(?:#{1,6}\s*)?chain[-\s]+of[-\s]+thought\s*:"
+    r")",
+    re.IGNORECASE,
 )
 
 _DEFAULT_ROUTE_KEY = "<task-default>"
@@ -95,6 +114,28 @@ def _strip_reasoning_blocks(text: str) -> str:
     return _THINK_BLOCK_RE.sub("", text)
 
 
+def _sanitize_reasoning_summary(text: str) -> str:
+    """Return a summary safe to persist, or ``""`` when the model returned only
+    reasoning.
+
+    ``_strip_reasoning_blocks`` removes *closed* ``<think>...</think>`` pairs,
+    but a reasoning model that runs into ``max_tokens`` before emitting the
+    closing tag leaves an *unclosed* block the paired-tag regex cannot match.
+    The leftover raw reasoning — which often quotes the summarizer system prompt
+    verbatim — would then be accepted as the summary purely because it is shorter
+    than the source. When the stripped remainder is empty, or still begins with
+    an (unclosed) reasoning marker, treat the result as unusable and return
+    ``""`` so the caller escalates to the next model / L2 / deterministic
+    fallback instead of persisting reasoning as the summary.
+    """
+    if not isinstance(text, str):
+        return ""
+    stripped = _strip_reasoning_blocks(text).strip()
+    if not stripped or _REASONING_START_RE.match(stripped):
+        return ""
+    return stripped
+
+
 def _call_llm_for_summary(prompt: str, max_tokens: int,
                            model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
@@ -113,7 +154,13 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
-        return _strip_reasoning_blocks(content).strip()
+        sanitized = _sanitize_reasoning_summary(content)
+        if content.strip() and not sanitized:
+            logger.warning(
+                "LCM summary discarded reasoning-only output (model=%s); escalating",
+                model or "<default>",
+            )
+        return sanitized
     except Exception as e:
         logger.warning("LLM summarization failed: %s", e)
         return None
@@ -218,6 +265,37 @@ def _invoke_summary_llm_chain(
     return None
 
 
+# PRD-8.3 Prong A — identifier-fidelity instruction. The block is ALWAYS on in
+# production (default). The ONLY reason it is toggleable is the AC-5
+# baseline-repro arm of the disambiguation campaign: to prove the K=2 bug still
+# reproduces, the baseline must run the PRE-FIX summarizer (fidelity OFF) on the
+# SAME code. Gated by an internal env var the harness sets per-subprocess; it is
+# NOT a user-facing setting. Default (unset) == on.
+_L1_IDENTIFIER_FIDELITY = (
+    "IDENTIFIER FIDELITY (do not violate): Never merge, group, range-collapse, or\n"
+    "abbreviate distinct identifier->value mappings (recovery codes, IDs, keys, file\n"
+    "paths, owner/person names). Each distinct identifier and its FULL value must\n"
+    "survive verbatim and separately, even when many look similar — similar is NOT\n"
+    "repetition. Never write a grouped/range line like \"1300/1600/1900 = Name\"; emit\n"
+    "one line per distinct identifier. Never truncate a value mid-word.\n"
+)
+_L2_IDENTIFIER_FIDELITY = (
+    "IDENTIFIER FIDELITY (do not violate): Never merge, group, range-collapse, or\n"
+    "truncate distinct identifier->value mappings (codes, IDs, keys, paths, names) —\n"
+    "one line per distinct identifier with its FULL value; \"similar\" is NOT a reason\n"
+    "to combine. No grouped/range lines like \"1300/1600/1900 = Name\".\n"
+)
+
+
+def _identifier_fidelity_enabled() -> bool:
+    """Default ON. Only the AC-5 baseline-repro arm sets this to a falsey value
+    to reproduce pre-fix (merge-prone) summarization on identical code."""
+    val = os.environ.get("LCM_IDENTIFIER_FIDELITY")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _build_l1_prompt(text: str, token_budget: int, depth: int,
                      focus_topic: str = "", custom_instructions: str = "") -> str:
     """Level 1: preserve details."""
@@ -234,10 +312,12 @@ def _build_l1_prompt(text: str, token_budget: int, depth: int,
     if custom_instructions:
         custom_block = f"\nAdditional instructions:\n{custom_instructions}\n"
 
+    fidelity = _L1_IDENTIFIER_FIDELITY if _identifier_fidelity_enabled() else ""
+
     return f"""Summarize this conversation segment for future turns.
 {guidance}
 Remove repetition and conversational filler.
-End with: "Expand for details about: <what was compressed>"
+{fidelity}End with: "Expand for details about: <what was compressed>"
 {focus_guidance}{custom_block}
 
 Target ~{token_budget} tokens.
@@ -249,16 +329,19 @@ CONTENT:
 def _build_l2_prompt(text: str, token_budget: int,
                      focus_topic: str = "", custom_instructions: str = "") -> str:
     """Level 2: aggressive bullet points."""
+
     focus_guidance = _build_l2_focus_brief(focus_topic)
 
     custom_block = ""
     if custom_instructions:
         custom_block = f"\nAdditional instructions:\n{custom_instructions}\n"
 
+    fidelity = _L2_IDENTIFIER_FIDELITY if _identifier_fidelity_enabled() else ""
+
     return f"""Compress this into bullet points. Maximum {token_budget} tokens.
 Keep only: decisions made, files changed, errors hit, current state.
 Drop all reasoning, alternatives considered, and process detail.
-{focus_guidance}{custom_block}
+{fidelity}{focus_guidance}{custom_block}
 
 CONTENT:
 {text}"""

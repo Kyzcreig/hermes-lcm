@@ -586,6 +586,12 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
     return total
 
 
+class _ExpansionSynthesisError(RuntimeError):
+    """Raised when lcm_expand_query's aux-LLM synthesis returns an error-shaped
+    or malformed response (no usable choices). Caught at the call site and turned
+    into a degraded payload, never propagated as an opaque TypeError."""
+
+
 def _synthesize_expansion_answer(
     *,
     prompt: str,
@@ -617,7 +623,25 @@ def _synthesize_expansion_answer(
     }
     apply_lcm_model_route(call_kwargs, model)
     response = call_llm(**call_kwargs)
-    content = response.choices[0].message.content
+    # call_llm can return an error-shaped or partial object under load/concurrency
+    # (e.g. the aux-LLM lane colliding with the foreground gateway's own calls):
+    # `.choices` may be missing, empty, or a non-subscriptable sentinel. Guard the
+    # access so a malformed response degrades cleanly instead of raising an opaque
+    # "'type' object is not subscriptable" that crashes the whole expand call.
+    choices = getattr(response, "choices", None)
+    first = None
+    if choices is not None:
+        try:
+            first = choices[0]
+        except (TypeError, IndexError, KeyError):
+            first = None
+    if first is None:
+        raise _ExpansionSynthesisError(
+            "expansion synthesis returned no choices "
+            f"(response type={type(response).__name__})"
+        )
+    message = getattr(first, "message", None)
+    content = getattr(message, "content", None)
     if not isinstance(content, str):
         content = str(content) if content else ""
     from .escalation import _strip_reasoning_blocks
@@ -783,7 +807,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    query = args.get("query", "").strip()
+    query = str(args.get("query") or "").strip()
     if not query:
         return json.dumps({"error": "No query provided"})
 
@@ -1007,26 +1031,31 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
         info = engine._dag.describe_subtree(node_id)
         return json.dumps(info)
 
-    all_nodes = engine._dag.get_session_nodes(session_id)
+    depth_stats = engine._dag.get_session_depth_stats(session_id)
+    depth_samples = engine._dag.get_session_depth_samples(
+        session_id,
+        per_depth_limit=20,
+        depths=list(depth_stats),
+    )
     overview = {
         "session_id": session_id,
         "store_message_count": engine._store.get_session_count(session_id),
         "depths": {},
     }
 
-    for depth in sorted({node.depth for node in all_nodes}):
-        nodes = [node for node in all_nodes if node.depth == depth]
+    for depth, stats in sorted(depth_stats.items()):
+        nodes = depth_samples.get(depth, [])
         overview["depths"][f"d{depth}"] = {
-            "count": len(nodes),
-            "total_tokens": sum(node.token_count for node in nodes),
-            "total_source_tokens": sum(node.source_token_count for node in nodes),
+            "count": stats["count"],
+            "total_tokens": stats["tokens"],
+            "total_source_tokens": stats["source_tokens"],
             "nodes": [
                 {
                     "node_id": node.node_id,
                     "token_count": node.token_count,
                     "expand_hint": node.expand_hint,
                 }
-                for node in nodes[:20]
+                for node in nodes
             ],
         }
 
@@ -1424,6 +1453,13 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             f"lcm_expand_query synthesis timed out after {timeout:.3g}s",
             include_timeout=True,
         )
+    except _ExpansionSynthesisError as exc:
+        # Malformed/error-shaped aux-LLM response (e.g. concurrency collision with
+        # the foreground gateway). Degrade gracefully instead of crashing the
+        # whole expand call with an opaque TypeError. The caller still gets the
+        # node matches; only the synthesized prose answer is unavailable.
+        logger.warning("LCM expand_query synthesis failed: %s", exc)
+        return _degraded_payload(f"lcm_expand_query synthesis unavailable: {exc}")
 
     answer = str(answer).strip() if answer is not None else ""
     if not answer:
@@ -1553,16 +1589,11 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     store_tokens = engine._store.get_session_token_total(session_id)
 
     # DAG stats by depth
-    all_nodes = engine._dag.get_session_nodes(session_id)
-    depths: dict[int, dict] = {}
-    for node in all_nodes:
-        d = depths.setdefault(node.depth, {"count": 0, "tokens": 0, "source_tokens": 0})
-        d["count"] += 1
-        d["tokens"] += node.token_count
-        d["source_tokens"] += node.source_token_count
+    depths = engine._dag.get_session_depth_stats(session_id)
 
     total_dag_tokens = sum(d["tokens"] for d in depths.values())
     total_source_tokens = sum(d["source_tokens"] for d in depths.values())
+    total_dag_nodes = sum(d["count"] for d in depths.values())
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
     full_status = engine.get_status()
     lifecycle = full_status.get("lifecycle")
@@ -1581,7 +1612,11 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "compression_count": engine.compression_count,
         "last_compression_status": full_status.get("last_compression_status", "idle"),
         "last_compression_noop_reason": full_status.get("last_compression_noop_reason", ""),
+        "model": full_status.get("model", ""),
+        "provider": full_status.get("provider", ""),
         "context_length": engine.context_length,
+        "context_length_source": full_status.get("context_length_source", ""),
+        "context_threshold": full_status.get("context_threshold", engine._config.context_threshold),
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,
         "last_input_tokens": engine.last_input_tokens,
@@ -1596,7 +1631,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "estimated_tokens": store_tokens,
         },
         "dag": {
-            "total_nodes": len(all_nodes),
+            "total_nodes": total_dag_nodes,
             "total_tokens": total_dag_tokens,
             "compression_ratio": f"{compression_ratio}:1",
             "depths": {
@@ -1605,6 +1640,11 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         },
         "config": {
             "fresh_tail_count": engine._config.fresh_tail_count,
+            "fresh_tail_token_budget_enabled": engine._config.fresh_tail_token_budget_enabled,
+            "fresh_tail_token_budget": getattr(engine, "_fresh_tail_token_budget", 0),
+            "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
+            "target_ratio": engine._config.target_ratio,
+            "last_fresh_tail_count": getattr(engine, "_last_fresh_tail_count", 0),
             "leaf_chunk_tokens": engine._config.leaf_chunk_tokens,
             "dynamic_leaf_chunk_enabled": engine._config.dynamic_leaf_chunk_enabled,
             "dynamic_leaf_chunk_max": engine._config.dynamic_leaf_chunk_max,
@@ -1638,6 +1678,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             ),
         },
         "source_lineage": source_lineage,
+        "storage_retention": full_status.get("storage_retention", {}),
         "ingest_protection": full_status.get("ingest_protection", sensitive_pattern_status(engine._config)),
         "preset_suggestion": preset_status_payload(engine),
         "ingest_reconciliation": ingest_reconciliation,
@@ -1916,6 +1957,29 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "check": "context_pressure",
             "status": "pass" if usage_pct < threshold_pct else "warn",
             "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
+        })
+
+    # 8. Retention policy (TTL + max bytes)
+    try:
+        retention = engine.get_status().get("storage_retention", {})
+        if "error" in retention:
+            checks.append({
+                "check": "retention_policy",
+                "status": "fail",
+                "detail": retention,
+            })
+        else:
+            exceeded = retention.get("ttl_exceeded") or retention.get("max_bytes_exceeded")
+            checks.append({
+                "check": "retention_policy",
+                "status": "warn" if exceeded else "pass",
+                "detail": retention,
+            })
+    except Exception as e:
+        checks.append({
+            "check": "retention_policy",
+            "status": "fail",
+            "detail": str(e),
         })
 
     overall = "healthy"
